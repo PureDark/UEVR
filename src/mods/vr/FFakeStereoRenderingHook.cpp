@@ -46,6 +46,7 @@
 #include <sdk/FName.hpp>
 #include <sdk/UObjectArray.hpp>
 #include <sdk/FBoolProperty.hpp>
+#include <sdk/FField.hpp>
 #include <sdk/FViewport.hpp>
 #include <sdk/UKismetRenderingLibrary.hpp>
 #include <sdk/UTexture.hpp>
@@ -1218,6 +1219,18 @@ AvowedNativeFixGateState g_avowed_native_fix_gate{};
 std::mutex g_ue56_rt_probe_mutex{};
 std::unordered_map<uintptr_t, bool> g_ue56_native_resource_probe_cache{};
 
+struct PokemonEmeraldUE56SceneTargetBootstrapState {
+    uintptr_t texture{};
+    uintptr_t vtable{};
+    std::chrono::steady_clock::time_point last_attempt{};
+    uint32_t attempts{};
+};
+
+std::mutex g_pokemon_emerald_ue56_scene_target_bootstrap_mutex{};
+PokemonEmeraldUE56SceneTargetBootstrapState g_pokemon_emerald_ue56_scene_target_bootstrap{};
+constexpr auto POKEMON_EMERALD_UE56_SCENE_TARGET_BOOTSTRAP_RETRY = std::chrono::milliseconds(250);
+constexpr uint32_t POKEMON_EMERALD_UE56_SCENE_TARGET_BOOTSTRAP_MAX_ATTEMPTS = 24;
+
 struct UE51RenderTargetChurnStats {
     uint64_t allocate_seen{};
     uint64_t ui_created{};
@@ -1355,6 +1368,16 @@ bool avowed_is_current_game() {
 }
 
 bool dune_awakening_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return uevr::games::dune_experimental_rendering_enabled &&
+               exe_path && uevr::games::is_dune_awakening_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+
+bool dune_native_fix_renderer_resolver_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
         return exe_path && uevr::games::is_dune_awakening_executable_path(*exe_path);
@@ -1810,9 +1833,17 @@ bool dimension_shift_is_auxiliary_view_family(sdk::FSceneViewFamily* view_family
 }
 
 bool dune_should_preserve_native_viewport_target() {
-    return dune_awakening_is_current_game() &&
-        g_hook != nullptr &&
-        (g_hook->is_dune_character_creation_active() || g_hook->dune_has_live_pawn());
+    if (!dune_awakening_is_current_game() ||
+        g_hook == nullptr ||
+        (!g_hook->is_dune_character_creation_active() && !g_hook->dune_has_live_pawn()))
+    {
+        return false;
+    }
+
+    // Native Stereo needs UEVR's separate stereo target. Keep the legacy AMD
+    // custom-present viewport only for Synced, AFR, DIBR, and fallback modes.
+    const auto vr = VR::get();
+    return vr == nullptr || !vr->is_using_native_stereo();
 }
 
 bool dune_is_auxiliary_view_family(sdk::FSceneViewFamily* view_family, const char* source) {
@@ -1871,6 +1902,27 @@ bool subnautica2_is_current_game() {
     return result;
 }
 
+bool pokemon_emerald_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+
+        if (!exe_path) {
+            return false;
+        }
+
+        auto lowered = *exe_path;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](wchar_t ch) {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+
+        return lowered.ends_with(L"\\pokemonemerald.exe") ||
+               lowered.ends_with(L"/pokemonemerald.exe") ||
+               lowered == L"pokemonemerald.exe";
+    }();
+
+    return result;
+}
+
 bool daysgone_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -1880,6 +1932,824 @@ bool daysgone_is_current_game() {
     }();
 
     return result;
+}
+
+constexpr size_t DAYS_GONE_VIEW_FAMILY_FRAME_NUMBER_OFFSET = 0x48;
+constexpr size_t DAYS_GONE_VIEW_FAMILY_USE_SEPARATE_RENDER_TARGET_OFFSET = 0x20;
+constexpr size_t DAYS_GONE_VIEW_FAMILY_RESOLVE_SCENE_OFFSET = 0x4E;
+constexpr size_t DAYS_GONE_SCENE_VIEW_IS_SCENE_CAPTURE_OFFSET = 0x1276;
+constexpr size_t DAYS_GONE_BEGIN_RENDERING_FRAME_SCAN_SIZE = 0x90;
+
+struct DaysGoneOffscreenViewContract {
+    std::array<uintptr_t, 3> flags{};
+    std::array<uint8_t, 3> original_values{};
+};
+
+constexpr std::array<uint8_t, 3> DAYS_GONE_OFFSCREEN_VIEW_VALUES{1, 0, 1};
+
+struct DaysGoneNativeFrameOverride {
+    sdk::FSceneViewFamily* family{};
+    uintptr_t gframe_number{};
+    uint32_t expected_frame{};
+    const char* failure_reason{};
+    bool active{};
+    bool applied{};
+};
+
+std::atomic<uintptr_t> g_daysgone_gframe_number{};
+thread_local DaysGoneNativeFrameOverride g_daysgone_native_frame_override{};
+
+bool read_daysgone_frame_value(uintptr_t address, uint32_t& value) {
+    if (!is_readable_process_range(address, sizeof(value))) {
+        return false;
+    }
+
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return true;
+}
+
+bool write_daysgone_frame_value(uintptr_t address, uint32_t value) {
+    if (!is_writable_process_range(address, sizeof(value))) {
+        return false;
+    }
+
+    std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    uint32_t observed{};
+    return read_daysgone_frame_value(address, observed) && observed == value;
+}
+
+bool read_daysgone_bool(uintptr_t address, uint8_t& value) {
+    if (!is_readable_process_range(address, sizeof(value))) {
+        return false;
+    }
+
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return value <= 1;
+}
+
+bool write_daysgone_bool(uintptr_t address, uint8_t value) {
+    if (value > 1 || !is_writable_process_range(address, sizeof(value))) {
+        return false;
+    }
+
+    std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    uint8_t observed{};
+    return read_daysgone_bool(address, observed) && observed == value;
+}
+
+bool validate_daysgone_offscreen_view_contract(
+    sdk::FSceneView* right_view,
+    sdk::FSceneViewFamily* family,
+    DaysGoneOffscreenViewContract& contract,
+    const char*& failure_reason)
+{
+    failure_reason = nullptr;
+    const auto view_address = reinterpret_cast<uintptr_t>(right_view);
+    const auto family_address = reinterpret_cast<uintptr_t>(family);
+    if (view_address == 0 || family_address == 0 ||
+        view_address > std::numeric_limits<uintptr_t>::max() -
+            DAYS_GONE_SCENE_VIEW_IS_SCENE_CAPTURE_OFFSET ||
+        family_address > std::numeric_limits<uintptr_t>::max() -
+            DAYS_GONE_VIEW_FAMILY_RESOLVE_SCENE_OFFSET)
+    {
+        failure_reason = "view or family address overflowed the UE4.11 layout";
+        return false;
+    }
+
+    contract.flags = {
+        view_address + DAYS_GONE_SCENE_VIEW_IS_SCENE_CAPTURE_OFFSET,
+        family_address + DAYS_GONE_VIEW_FAMILY_USE_SEPARATE_RENDER_TARGET_OFFSET,
+        family_address + DAYS_GONE_VIEW_FAMILY_RESOLVE_SCENE_OFFSET,
+    };
+    for (size_t index = 0; index < contract.flags.size(); ++index) {
+        if (!read_daysgone_bool(contract.flags[index], contract.original_values[index]) ||
+            !is_writable_process_range(contract.flags[index], sizeof(uint8_t)))
+        {
+            failure_reason = "Bend offscreen view/family flags did not validate";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool restore_daysgone_offscreen_view_contract(const DaysGoneOffscreenViewContract& contract) {
+    bool restored{true};
+    for (size_t index = 0; index < contract.flags.size(); ++index) {
+        restored = write_daysgone_bool(
+            contract.flags[index],
+            contract.original_values[index]) && restored;
+    }
+    return restored;
+}
+
+bool apply_daysgone_offscreen_view_contract(const DaysGoneOffscreenViewContract& contract) {
+    for (size_t index = 0; index < contract.flags.size(); ++index) {
+        if (!write_daysgone_bool(
+                contract.flags[index],
+                DAYS_GONE_OFFSCREEN_VIEW_VALUES[index]))
+        {
+            restore_daysgone_offscreen_view_contract(contract);
+            return false;
+        }
+    }
+    return true;
+}
+
+uintptr_t resolve_daysgone_gframe_number(uintptr_t begin_rendering_view_family) {
+    if (!daysgone_is_current_game() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx11() ||
+        !is_executable_process_range(
+            begin_rendering_view_family,
+            DAYS_GONE_BEGIN_RENDERING_FRAME_SCAN_SIZE))
+    {
+        return 0;
+    }
+
+    const auto executable = utility::get_executable();
+    const auto module_base = reinterpret_cast<uintptr_t>(executable);
+    const auto module_size = utility::get_module_size(executable).value_or(0);
+    const auto module_end = module_base + module_size;
+    if (module_base == 0 || module_size < sizeof(uint32_t) || module_end < module_base) {
+        return 0;
+    }
+
+    // UE4.11 changes GFrameNumber once, then stores that same value into
+    // FSceneViewFamily::FrameNumber before invoking view extensions.
+    constexpr size_t sequence_size = 17;
+    uintptr_t resolved{};
+    size_t matches{};
+    for (size_t offset = 0;
+         offset + sequence_size <= DAYS_GONE_BEGIN_RENDERING_FRAME_SCAN_SIZE;
+         ++offset)
+    {
+        const auto instruction = begin_rendering_view_family + offset;
+        const auto* bytes = reinterpret_cast<const uint8_t*>(instruction);
+        if (bytes[0] != 0x8B || bytes[1] != 0x0D ||
+            bytes[6] != 0xFF || bytes[7] != 0xC1 ||
+            bytes[8] != 0x89 || bytes[9] != 0x0D ||
+            bytes[14] != 0x89 || bytes[15] != 0x4B || bytes[16] != 0x48)
+        {
+            continue;
+        }
+
+        int32_t read_displacement{};
+        int32_t write_displacement{};
+        std::memcpy(&read_displacement, bytes + 2, sizeof(read_displacement));
+        std::memcpy(&write_displacement, bytes + 10, sizeof(write_displacement));
+
+        const auto read_target_signed =
+            static_cast<int64_t>(instruction + 6) + static_cast<int64_t>(read_displacement);
+        const auto write_target_signed =
+            static_cast<int64_t>(instruction + 14) + static_cast<int64_t>(write_displacement);
+        if (read_target_signed <= 0 || read_target_signed != write_target_signed) {
+            continue;
+        }
+
+        const auto target = static_cast<uintptr_t>(read_target_signed);
+        if (target < module_base || target > module_end - sizeof(uint32_t) ||
+            !is_readable_process_range(target, sizeof(uint32_t)) ||
+            !is_writable_process_range(target, sizeof(uint32_t)))
+        {
+            continue;
+        }
+
+        resolved = target;
+        if (++matches > 1) {
+            return 0;
+        }
+    }
+
+    return matches == 1 ? resolved : 0;
+}
+
+void configure_daysgone_gframe_number(uintptr_t begin_rendering_view_family) {
+    if (!daysgone_is_current_game()) {
+        return;
+    }
+
+    const auto resolved = resolve_daysgone_gframe_number(begin_rendering_view_family);
+    g_daysgone_gframe_number.store(resolved, std::memory_order_release);
+    if (resolved != 0) {
+        const auto module_base = reinterpret_cast<uintptr_t>(utility::get_executable());
+        SPDLOG_INFO(
+            "[DaysGone][NativeFix] Resolved GFrameNumber at RVA 0x{:X}",
+            resolved - module_base);
+    } else {
+        SPDLOG_ERROR(
+            "[DaysGone][NativeFix] Rejected the BeginRenderingViewFamily frame-number sequence; "
+            "same-frame right-eye rendering will fail closed");
+    }
+}
+
+bool read_daysgone_frame_state(
+    sdk::FSceneViewFamily* family,
+    uint32_t& global_frame,
+    uint32_t& family_frame)
+{
+    const auto gframe_number = g_daysgone_gframe_number.load(std::memory_order_acquire);
+    const auto family_address = reinterpret_cast<uintptr_t>(family);
+    if (gframe_number == 0 || family_address == 0 ||
+        family_address > std::numeric_limits<uintptr_t>::max() -
+            DAYS_GONE_VIEW_FAMILY_FRAME_NUMBER_OFFSET)
+    {
+        return false;
+    }
+
+    const auto family_frame_address =
+        family_address + DAYS_GONE_VIEW_FAMILY_FRAME_NUMBER_OFFSET;
+    return read_daysgone_frame_value(gframe_number, global_frame) &&
+        read_daysgone_frame_value(family_frame_address, family_frame) &&
+        is_writable_process_range(gframe_number, sizeof(uint32_t)) &&
+        is_writable_process_range(family_frame_address, sizeof(uint32_t));
+}
+
+bool begin_daysgone_native_frame_override(
+    sdk::FSceneViewFamily* family,
+    uint32_t expected_frame,
+    const char*& failure_reason)
+{
+    failure_reason = nullptr;
+    if (g_daysgone_native_frame_override.active) {
+        failure_reason = "same-frame override was already active";
+        return false;
+    }
+
+    uint32_t global_frame{};
+    uint32_t family_frame{};
+    if (!read_daysgone_frame_state(family, global_frame, family_frame)) {
+        failure_reason = "frame-number storage became inaccessible";
+        return false;
+    }
+    if (global_frame != expected_frame || family_frame != expected_frame) {
+        failure_reason = "first renderer frame identity changed before the right-eye call";
+        return false;
+    }
+
+    g_daysgone_native_frame_override = {
+        .family = family,
+        .gframe_number = g_daysgone_gframe_number.load(std::memory_order_acquire),
+        .expected_frame = expected_frame,
+        .active = true,
+    };
+    return true;
+}
+
+void apply_daysgone_native_frame_override(sdk::FSceneViewFamily& family) {
+    auto& transaction = g_daysgone_native_frame_override;
+    if (!transaction.active || transaction.applied) {
+        return;
+    }
+    if (transaction.family != &family) {
+        transaction.failure_reason = "right-eye callback used a different view family";
+        return;
+    }
+
+    const auto family_frame_address =
+        reinterpret_cast<uintptr_t>(&family) + DAYS_GONE_VIEW_FAMILY_FRAME_NUMBER_OFFSET;
+    const auto incremented_frame = transaction.expected_frame + 1u;
+    uint32_t global_frame{};
+    uint32_t family_frame{};
+    if (!read_daysgone_frame_value(transaction.gframe_number, global_frame) ||
+        !read_daysgone_frame_value(family_frame_address, family_frame) ||
+        global_frame != incremented_frame || family_frame != incremented_frame)
+    {
+        transaction.failure_reason = "second renderer did not expose the exact incremented frame identity";
+        return;
+    }
+    if (!is_writable_process_range(transaction.gframe_number, sizeof(uint32_t)) ||
+        !is_writable_process_range(family_frame_address, sizeof(uint32_t)))
+    {
+        transaction.failure_reason = "second renderer frame-number storage was not writable";
+        return;
+    }
+
+    const auto expected_frame = transaction.expected_frame;
+    std::memcpy(
+        reinterpret_cast<void*>(family_frame_address),
+        &expected_frame,
+        sizeof(expected_frame));
+    std::memcpy(
+        reinterpret_cast<void*>(transaction.gframe_number),
+        &expected_frame,
+        sizeof(expected_frame));
+
+    if (!read_daysgone_frame_value(transaction.gframe_number, global_frame) ||
+        !read_daysgone_frame_value(family_frame_address, family_frame) ||
+        global_frame != expected_frame || family_frame != expected_frame)
+    {
+        // Preserve the game's unmodified second-call state if the two writes
+        // cannot be committed as one validated transaction.
+        write_daysgone_frame_value(family_frame_address, incremented_frame);
+        write_daysgone_frame_value(transaction.gframe_number, incremented_frame);
+        transaction.failure_reason = "same-frame normalization did not commit atomically";
+        return;
+    }
+
+    transaction.applied = true;
+    SPDLOG_INFO_ONCE(
+        "[DaysGone][NativeFix] Kept both eye renderers on one validated UE4.11 engine frame");
+}
+
+void restore_daysgone_incremented_frame_if_exact(
+    sdk::FSceneViewFamily* family,
+    uint32_t expected_frame)
+{
+    const auto gframe_number = g_daysgone_gframe_number.load(std::memory_order_acquire);
+    const auto family_frame_address =
+        reinterpret_cast<uintptr_t>(family) + DAYS_GONE_VIEW_FAMILY_FRAME_NUMBER_OFFSET;
+    const auto incremented_frame = expected_frame + 1u;
+    uint32_t observed{};
+    if (read_daysgone_frame_value(gframe_number, observed) && observed == incremented_frame) {
+        write_daysgone_frame_value(gframe_number, expected_frame);
+    }
+    if (read_daysgone_frame_value(family_frame_address, observed) && observed == incremented_frame) {
+        write_daysgone_frame_value(family_frame_address, expected_frame);
+    }
+}
+
+void clear_daysgone_native_frame_override() {
+    g_daysgone_native_frame_override = {};
+}
+
+using DaysGoneStaticConstructObjectFn = sdk::UObject*(__fastcall*)(
+    sdk::UClass*,
+    sdk::UObject*,
+    sdk::FName,
+    uint32_t,
+    uint32_t,
+    sdk::UObject*,
+    bool,
+    void*,
+    bool);
+using DaysGoneRegisterComponentFn = void(__fastcall*)(sdk::UActorComponent*);
+using DaysGoneRegisterComponentWithWorldFn =
+    void(__fastcall*)(sdk::UActorComponent*, sdk::UWorld*, bool);
+
+constexpr auto DAYS_GONE_STATIC_CONSTRUCT_OBJECT_PATTERN =
+    "48 89 5C 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 40 FF FF FF "
+    "48 81 EC C0 01 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 85 B0 00 00 00 45 8B F9 "
+    "49 8B D8 48 8B F2 48 8B F9 44 8B A5 20 01 00 00 44 0F B6 AD 40 01 00 00 "
+    "4C 8B B5 28 01 00 00 F7 81 A4 00 00 00 80 00 00 10";
+constexpr auto DAYS_GONE_REGISTER_COMPONENT_PATTERN =
+    "48 89 5C 24 08 57 48 83 EC 20 48 8B 99 B0 00 00 00 48 8B F9 48 85 DB 74 ? "
+    "48 8B 03 48 8B CB FF 90 40 01 00 00 48 85 C0 74 ? 48 8B 03 48 8B CB "
+    "FF 90 40 01 00 00 45 33 C0 48 8B CF 48 8B D0 E8 ? ? ? ? "
+    "48 8B 5C 24 30 48 83 C4 20 5F C3";
+constexpr auto DAYS_GONE_REGISTER_COMPONENT_WITH_WORLD_PATTERN =
+    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 "
+    "41 0F B6 F0 48 8B EA 48 8B D9 48 63 41 0C 85 C0 78 ? 3B 05 ? ? ? ?";
+
+template <typename Fn>
+Fn resolve_unique_daysgone_native_function(const char* pattern, size_t validation_size, const char* name) {
+    if (!daysgone_is_current_game() || g_framework == nullptr || !g_framework->is_dx11()) {
+        return nullptr;
+    }
+
+    const auto executable = utility::get_executable();
+    const auto module_size = utility::get_module_size(executable).value_or(0);
+    const auto module_base = reinterpret_cast<uintptr_t>(executable);
+    const auto module_end = module_base + module_size;
+    if (module_base == 0 || module_size == 0 || module_end < module_base) {
+        SPDLOG_ERROR("[DaysGone][NativeFix] Cannot scan the executable for {}", name);
+        return nullptr;
+    }
+
+    const auto match = utility::scan(module_base, module_size, pattern);
+    if (!match ||
+        !is_executable_process_range(*match, validation_size) ||
+        utility::get_module_within(*match).value_or(nullptr) != executable)
+    {
+        SPDLOG_ERROR("[DaysGone][NativeFix] {} signature did not validate", name);
+        return nullptr;
+    }
+
+    const auto next_address = *match + 1;
+    if (next_address < module_end &&
+        utility::scan(next_address, module_end - next_address, pattern).has_value())
+    {
+        SPDLOG_ERROR("[DaysGone][NativeFix] {} signature was not unique", name);
+        return nullptr;
+    }
+
+    SPDLOG_INFO(
+        "[DaysGone][NativeFix] Resolved {} at RVA 0x{:X}",
+        name,
+        *match - module_base);
+    return reinterpret_cast<Fn>(*match);
+}
+
+DaysGoneStaticConstructObjectFn resolve_daysgone_static_construct_object() {
+    static const auto result = resolve_unique_daysgone_native_function<DaysGoneStaticConstructObjectFn>(
+        DAYS_GONE_STATIC_CONSTRUCT_OBJECT_PATTERN,
+        0x90,
+        "StaticConstructObject_Internal");
+    return result;
+}
+
+DaysGoneRegisterComponentFn resolve_daysgone_register_component() {
+    static const auto result = resolve_unique_daysgone_native_function<DaysGoneRegisterComponentFn>(
+        DAYS_GONE_REGISTER_COMPONENT_PATTERN,
+        0x48,
+        "UActorComponent::RegisterComponent");
+    return result;
+}
+
+DaysGoneRegisterComponentWithWorldFn resolve_daysgone_register_component_with_world() {
+    static const auto result =
+        resolve_unique_daysgone_native_function<DaysGoneRegisterComponentWithWorldFn>(
+            DAYS_GONE_REGISTER_COMPONENT_WITH_WORLD_PATTERN,
+            0xC0,
+            "UActorComponent::RegisterComponentWithWorld");
+    return result;
+}
+
+bool validate_daysgone_register_component_layout(
+    DaysGoneRegisterComponentFn register_component,
+    DaysGoneRegisterComponentWithWorldFn register_component_with_world)
+{
+    static const bool result = [register_component, register_component_with_world]() {
+        if (register_component == nullptr || register_component_with_world == nullptr) {
+            return false;
+        }
+
+        constexpr size_t register_with_world_call_offset = 0x3F;
+        const auto register_address = reinterpret_cast<uintptr_t>(register_component);
+        if (!is_readable_process_range(register_address, register_with_world_call_offset + 5) ||
+            *reinterpret_cast<const uint8_t*>(register_address + register_with_world_call_offset) != 0xE8)
+        {
+            return false;
+        }
+
+        const auto displacement = *reinterpret_cast<const int32_t*>(
+            register_address + register_with_world_call_offset + 1);
+        const auto decoded_target = static_cast<uintptr_t>(
+            static_cast<int64_t>(register_address + register_with_world_call_offset + 5) + displacement);
+        const auto expected_target = reinterpret_cast<uintptr_t>(register_component_with_world);
+        if (decoded_target != expected_target) {
+            return false;
+        }
+
+        return utility::scan(expected_target, 0xC0, "F6 81 A8 00 00 00 01").has_value() &&
+            utility::scan(expected_target, 0xC0, "48 8B B9 B0 00 00 00").has_value() &&
+            utility::scan(expected_target, 0xC0, "48 89 AB C8 00 00 00").has_value();
+    }();
+
+    return result;
+}
+
+sdk::USceneCaptureComponent2D* create_daysgone_legacy_scene_capture_component(
+    sdk::AActor* owner,
+    sdk::UClass* component_class,
+    sdk::UWorld* world)
+{
+    if (!daysgone_is_current_game() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx11() ||
+        owner == nullptr ||
+        component_class == nullptr ||
+        world == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(owner), sdk::UObjectBase::get_class_size()) ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(component_class), sizeof(void*)) ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(world), sdk::UObjectBase::get_class_size()))
+    {
+        return nullptr;
+    }
+
+    const auto construct_object = resolve_daysgone_static_construct_object();
+    const auto register_component = resolve_daysgone_register_component();
+    const auto register_component_with_world = resolve_daysgone_register_component_with_world();
+    if (construct_object == nullptr ||
+        !validate_daysgone_register_component_layout(
+            register_component,
+            register_component_with_world))
+    {
+        SPDLOG_ERROR_ONCE("[DaysGone][NativeFix] Rejected the legacy SceneCaptureComponent2D factory functions");
+        return nullptr;
+    }
+
+    try {
+        const auto actor_class = sdk::AActor::static_class();
+        const auto scene_component_class = sdk::USceneComponent::static_class();
+        const auto actor_component_class = sdk::UActorComponent::static_class();
+        if (actor_class == nullptr ||
+            scene_component_class == nullptr ||
+            actor_component_class == nullptr ||
+            !owner->is_a(actor_class) ||
+            !component_class->is_a(scene_component_class) ||
+            !component_class->is_a(actor_component_class))
+        {
+            SPDLOG_ERROR("[DaysGone][NativeFix] Rejected the legacy SceneCaptureComponent2D class or owner");
+            return nullptr;
+        }
+
+        sdk::FName object_name{};
+        auto* object = construct_object(
+            component_class,
+            owner,
+            object_name,
+            0,
+            0,
+            nullptr,
+            false,
+            nullptr,
+            true);
+        if (object == nullptr ||
+            !is_readable_process_range(reinterpret_cast<uintptr_t>(object), sdk::UObjectBase::get_class_size()) ||
+            !is_writable_process_range(reinterpret_cast<uintptr_t>(object), sdk::UObjectBase::get_class_size()) ||
+            object->get_class() != component_class ||
+            object->get_outer() != owner ||
+            !object->is_a(component_class))
+        {
+            SPDLOG_ERROR("[DaysGone][NativeFix] StaticConstructObject returned an invalid SceneCaptureComponent2D");
+            return nullptr;
+        }
+
+        const auto executable = utility::get_executable();
+        const auto vtable = *reinterpret_cast<const uintptr_t*>(object);
+        if (!is_readable_process_range(vtable, sizeof(uintptr_t)) ||
+            utility::get_module_within(vtable).value_or(nullptr) != executable ||
+            !is_executable_process_range(*reinterpret_cast<const uintptr_t*>(vtable), 1) ||
+            utility::get_module_within(*reinterpret_cast<const uintptr_t*>(vtable)).value_or(nullptr) != executable)
+        {
+            SPDLOG_ERROR("[DaysGone][NativeFix] Constructed SceneCaptureComponent2D vtable did not validate");
+            return nullptr;
+        }
+
+        auto* component = static_cast<sdk::USceneCaptureComponent2D*>(object);
+        if (owner->get_root_component() == nullptr) {
+            owner->set_root_component(component);
+        } else {
+            component->attach_to(owner->get_root_component());
+        }
+        component->set_local_transform(
+            {0.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 1.0f},
+            {1.0f, 1.0f, 1.0f},
+            false,
+            false);
+
+        constexpr size_t component_flags_offset = 0xA8;
+        constexpr size_t owner_private_offset = 0xB0;
+        constexpr size_t world_private_offset = 0xC8;
+        constexpr uint32_t registered_mask = 0x1;
+        constexpr size_t required_component_size = world_private_offset + sizeof(void*);
+        const auto component_address = reinterpret_cast<uintptr_t>(component);
+        if (!is_readable_process_range(component_address, required_component_size) ||
+            !is_writable_process_range(component_address, required_component_size))
+        {
+            SPDLOG_ERROR("[DaysGone][NativeFix] SceneCaptureComponent2D native registration layout was inaccessible");
+            return nullptr;
+        }
+
+        const auto owner_private = *reinterpret_cast<sdk::AActor* const*>(
+            component_address + owner_private_offset);
+        if (owner_private != owner) {
+            SPDLOG_ERROR(
+                "[DaysGone][NativeFix] SceneCaptureComponent2D owner did not initialize (expected={:x}, actual={:x})",
+                reinterpret_cast<uintptr_t>(owner),
+                reinterpret_cast<uintptr_t>(owner_private));
+            return nullptr;
+        }
+
+        register_component(component);
+        const auto component_flags = *reinterpret_cast<const uint32_t*>(
+            component_address + component_flags_offset);
+        const auto world_private = *reinterpret_cast<sdk::UWorld* const*>(
+            component_address + world_private_offset);
+        if ((component_flags & registered_mask) == 0 || world_private != world) {
+            SPDLOG_ERROR(
+                "[DaysGone][NativeFix] SceneCaptureComponent2D registration did not complete "
+                "(flags=0x{:X}, expected_world={:x}, actual_world={:x})",
+                component_flags,
+                reinterpret_cast<uintptr_t>(world),
+                reinterpret_cast<uintptr_t>(world_private));
+            return nullptr;
+        }
+
+        SPDLOG_INFO(
+            "[DaysGone][NativeFix] Constructed and registered legacy SceneCaptureComponent2D {:x}",
+            reinterpret_cast<uintptr_t>(component));
+        return component;
+    } catch (...) {
+        SPDLOG_ERROR("[DaysGone][NativeFix] Legacy SceneCaptureComponent2D construction raised an exception");
+        return nullptr;
+    }
+}
+
+using DaysGoneInitCustomFormatFn =
+    void(__fastcall*)(sdk::UTexture*, uint32_t, uint32_t, uint8_t, bool);
+
+constexpr auto DAYS_GONE_INIT_CUSTOM_FORMAT_PATTERN =
+    "0F B6 44 24 28 83 A1 CC 00 00 00 FE 09 81 CC 00 00 00 "
+    "48 8B 01 89 91 B0 00 00 00 44 89 81 B4 00 00 00 44 88 89 D0 "
+    "00 00 00 48 FF A0 18 02 00 00";
+
+DaysGoneInitCustomFormatFn resolve_daysgone_init_custom_format() {
+    static const auto result = []() -> DaysGoneInitCustomFormatFn {
+        if (!daysgone_is_current_game() || g_framework == nullptr || !g_framework->is_dx11()) {
+            return nullptr;
+        }
+
+        const auto executable = utility::get_executable();
+        const auto module_size = utility::get_module_size(executable).value_or(0);
+        const auto module_base = reinterpret_cast<uintptr_t>(executable);
+        const auto module_end = module_base + module_size;
+
+        if (module_base == 0 || module_size == 0 || module_end < module_base) {
+            SPDLOG_ERROR("[DaysGone][NativeFix] Cannot scan the executable for UTextureRenderTarget2D::InitCustomFormat");
+            return nullptr;
+        }
+
+        const auto match = utility::scan(
+            module_base,
+            module_size,
+            DAYS_GONE_INIT_CUSTOM_FORMAT_PATTERN);
+        if (!match ||
+            !is_executable_process_range(*match, 0x32) ||
+            utility::get_module_within(*match).value_or(nullptr) != executable)
+        {
+            SPDLOG_ERROR("[DaysGone][NativeFix] UTextureRenderTarget2D::InitCustomFormat signature did not validate");
+            return nullptr;
+        }
+
+        const auto next_address = *match + 1;
+        if (next_address < module_end &&
+            utility::scan(
+                next_address,
+                module_end - next_address,
+                DAYS_GONE_INIT_CUSTOM_FORMAT_PATTERN).has_value())
+        {
+            SPDLOG_ERROR("[DaysGone][NativeFix] UTextureRenderTarget2D::InitCustomFormat signature was not unique");
+            return nullptr;
+        }
+
+        SPDLOG_INFO(
+            "[DaysGone][NativeFix] Resolved UTextureRenderTarget2D::InitCustomFormat at RVA 0x{:X}",
+            *match - module_base);
+        return reinterpret_cast<DaysGoneInitCustomFormatFn>(*match);
+    }();
+
+    return result;
+}
+
+bool validate_daysgone_render_target_layout(sdk::UClass* render_target_class) {
+    if (render_target_class == nullptr ||
+        !sdk::FField::is_ufield_only() ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(render_target_class), sizeof(void*)))
+    {
+        return false;
+    }
+
+    try {
+        if (render_target_class->get_properties_size() != 0xD8) {
+            return false;
+        }
+
+        constexpr std::array<std::pair<std::wstring_view, int32_t>, 7> required_properties{
+            std::pair{std::wstring_view{L"SizeX"}, 0xB0},
+            std::pair{std::wstring_view{L"SizeY"}, 0xB4},
+            std::pair{std::wstring_view{L"ClearColor"}, 0xB8},
+            std::pair{std::wstring_view{L"AddressX"}, 0xC8},
+            std::pair{std::wstring_view{L"AddressY"}, 0xC9},
+            std::pair{std::wstring_view{L"bForceLinearGamma"}, 0xCC},
+            std::pair{std::wstring_view{L"bAutoGenerateMips"}, 0xCC},
+        };
+
+        for (const auto& [name, expected_offset] : required_properties) {
+            const auto property = render_target_class->find_property(name);
+            if (property == nullptr ||
+                !is_readable_process_range(reinterpret_cast<uintptr_t>(property), sizeof(void*)) ||
+                property->get_offset() != expected_offset)
+            {
+                return false;
+            }
+        }
+
+        const auto override_format = render_target_class->find_property(L"OverrideFormat");
+        return override_format != nullptr &&
+            is_readable_process_range(reinterpret_cast<uintptr_t>(override_format), sizeof(void*)) &&
+            override_format->get_offset() == 0xD0;
+    } catch (...) {
+        return false;
+    }
+}
+
+sdk::UTexture* create_daysgone_legacy_render_target(
+    sdk::UGameplayStatics* gameplay_statics,
+    sdk::UObject* outer,
+    uint32_t width,
+    uint32_t height)
+{
+    constexpr uint32_t render_target_size = 0xD8;
+    constexpr uint32_t clear_color_offset = 0xB8;
+    constexpr uint32_t flags_offset = 0xCC;
+    constexpr uint32_t override_format_offset = 0xD0;
+    constexpr uint32_t auto_generate_mips_mask = 0x4;
+    constexpr uint8_t pixel_format_b8g8r8a8 = 2;
+    constexpr size_t update_resource_slot = 0x218 / sizeof(uintptr_t);
+    constexpr size_t create_resource_slot = 0x220 / sizeof(uintptr_t);
+
+    if (!daysgone_is_current_game() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx11() ||
+        gameplay_statics == nullptr ||
+        outer == nullptr ||
+        width == 0 || height == 0 ||
+        width > 16384 || height > 16384)
+    {
+        return nullptr;
+    }
+
+    const auto init_custom_format = resolve_daysgone_init_custom_format();
+    const auto render_target_class =
+        sdk::find_uobject<sdk::UClass>(L"Class /Script/Engine.TextureRenderTarget2D");
+    if (init_custom_format == nullptr ||
+        !validate_daysgone_render_target_layout(render_target_class))
+    {
+        SPDLOG_ERROR_ONCE("[DaysGone][NativeFix] Rejected the legacy TextureRenderTarget2D factory layout");
+        return nullptr;
+    }
+
+    auto* object = gameplay_statics->spawn_object(render_target_class, outer);
+    if (object == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(object), render_target_size) ||
+        !is_writable_process_range(reinterpret_cast<uintptr_t>(object), render_target_size))
+    {
+        SPDLOG_ERROR("[DaysGone][NativeFix] Failed to spawn a writable TextureRenderTarget2D");
+        return nullptr;
+    }
+
+    try {
+        if (!object->is_a(render_target_class)) {
+            SPDLOG_ERROR("[DaysGone][NativeFix] SpawnObject returned the wrong UObject class");
+            return nullptr;
+        }
+    } catch (...) {
+        SPDLOG_ERROR("[DaysGone][NativeFix] Could not validate the spawned TextureRenderTarget2D class");
+        return nullptr;
+    }
+
+    const auto executable = utility::get_executable();
+    const auto vtable = *reinterpret_cast<const uintptr_t*>(object);
+    if (!is_readable_process_range(
+            vtable,
+            (create_resource_slot + 1) * sizeof(uintptr_t)) ||
+        utility::get_module_within(vtable).value_or(nullptr) != executable)
+    {
+        SPDLOG_ERROR("[DaysGone][NativeFix] Spawned TextureRenderTarget2D vtable did not validate");
+        return nullptr;
+    }
+
+    const auto update_resource = *reinterpret_cast<const uintptr_t*>(
+        vtable + update_resource_slot * sizeof(uintptr_t));
+    const auto create_resource = *reinterpret_cast<const uintptr_t*>(
+        vtable + create_resource_slot * sizeof(uintptr_t));
+    if (!is_executable_process_range(update_resource, 1) ||
+        !is_executable_process_range(create_resource, 1) ||
+        utility::get_module_within(update_resource).value_or(nullptr) != executable ||
+        utility::get_module_within(create_resource).value_or(nullptr) != executable ||
+        !utility::scan(update_resource, 0x100, "48 83 79 50 00").has_value() ||
+        !utility::scan(update_resource, 0x100, "FF 90 20 02 00 00").has_value())
+    {
+        SPDLOG_ERROR("[DaysGone][NativeFix] TextureRenderTarget2D resource virtuals did not validate");
+        return nullptr;
+    }
+
+    constexpr std::array<float, 4> clear_color{0.0f, 0.0f, 0.0f, 1.0f};
+    std::memcpy(
+        reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(object) + clear_color_offset),
+        clear_color.data(),
+        sizeof(clear_color));
+    auto& flags = *reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uintptr_t>(object) + flags_offset);
+    flags &= ~auto_generate_mips_mask;
+
+    auto* texture = static_cast<sdk::UTexture*>(object);
+    init_custom_format(texture, width, height, pixel_format_b8g8r8a8, false);
+
+    const auto object_address = reinterpret_cast<uintptr_t>(object);
+    const auto size_x = *reinterpret_cast<const uint32_t*>(object_address + 0xB0);
+    const auto size_y = *reinterpret_cast<const uint32_t*>(object_address + 0xB4);
+    const auto initialized_flags = *reinterpret_cast<const uint32_t*>(object_address + flags_offset);
+    const auto override_format = *reinterpret_cast<const uint8_t*>(object_address + override_format_offset);
+    if (size_x != width ||
+        size_y != height ||
+        override_format != pixel_format_b8g8r8a8 ||
+        (initialized_flags & 0x1) != 0 ||
+        (initialized_flags & auto_generate_mips_mask) != 0)
+    {
+        SPDLOG_ERROR("[DaysGone][NativeFix] TextureRenderTarget2D initialization did not persist the requested layout");
+        return nullptr;
+    }
+
+    SPDLOG_INFO(
+        "[DaysGone][NativeFix] Created legacy TextureRenderTarget2D {:x} [{}x{} PF_B8G8R8A8]",
+        object_address,
+        width,
+        height);
+    return texture;
 }
 
 bool strikers_club_is_current_game() {
@@ -3959,6 +4829,7 @@ bool supports_ue55_dedicated_ui_target_for_current_game() {
             everspace2_is_current_game() ||
             directive8020_is_current_game() ||
             everwind_is_current_game() ||
+            pokemon_emerald_is_current_game() ||
             is_deadzone_ue56_executable()) &&
         g_framework != nullptr &&
         g_framework->is_dx12() &&
@@ -3980,6 +4851,7 @@ bool should_preserve_promoted_ue55_slate_target() {
     return aphelion_is_current_game() ||
         mechwarrior_clans_is_current_game() ||
         everwind_is_current_game() ||
+        pokemon_emerald_is_current_game() ||
         is_deadzone_ue56_executable();
 }
 
@@ -4389,6 +5261,21 @@ bool get_d3d12_resource_desc_guarded(ID3D12Resource* resource, D3D12_RESOURCE_DE
     }
 }
 
+bool get_d3d12_resource_device_guarded(ID3D12Resource* resource, ID3D12Device4** out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    *out = nullptr;
+
+    __try {
+        return resource != nullptr && SUCCEEDED(resource->GetDevice(IID_PPV_ARGS(out))) && *out != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *out = nullptr;
+        return false;
+    }
+}
+
 std::optional<uintptr_t> ue55_find_texture_desc_offset(FRHITexture2D* texture) {
     if (texture == nullptr || IsBadReadPtr(texture, sizeof(void*))) {
         return std::nullopt;
@@ -4555,6 +5442,143 @@ bool ue55_dx12_try_get_native_resource_direct(
     }
 
     return false;
+}
+
+bool pokemon_emerald_ue56_try_bootstrap_scene_target(
+    FRHITexture2D* texture,
+    const char* source,
+    ID3D12Resource** out_native,
+    D3D12_RESOURCE_DESC* out_desc)
+{
+    if (out_native != nullptr) {
+        *out_native = nullptr;
+    }
+
+    if (out_desc != nullptr) {
+        *out_desc = {};
+    }
+
+    const bool known_viewport_source =
+        source != nullptr && std::string_view{source} == "UGameViewportClient::Draw viewport";
+
+    // Pokemon Emerald's matching BinFoldV3 PDB confirms that this UE5.6
+    // viewport candidate is FD3D12Texture and GetNativeResource is vtable slot
+    // 7. Keep the general UE5.6 probe disabled and admit only this exact game,
+    // RHI, engine, and source after runtime descriptor/device validation.
+    if (!pokemon_emerald_is_current_game() ||
+        !is_ue_5_6_dx12_backend() ||
+        !known_viewport_source ||
+        texture == nullptr ||
+        IsBadReadPtr(texture, sizeof(void*)))
+    {
+        return false;
+    }
+
+    void* vtable = nullptr;
+
+    try {
+        vtable = *(void**)texture;
+    } catch (...) {
+        return false;
+    }
+
+    if (vtable == nullptr || IsBadReadPtr(vtable, sizeof(void*) * 8)) {
+        return false;
+    }
+
+    uint32_t attempt{};
+    bool should_probe{};
+    const auto now = std::chrono::steady_clock::now();
+
+    {
+        std::scoped_lock _{g_pokemon_emerald_ue56_scene_target_bootstrap_mutex};
+        auto& state = g_pokemon_emerald_ue56_scene_target_bootstrap;
+
+        if (state.texture != (uintptr_t)texture || state.vtable != (uintptr_t)vtable) {
+            state = {
+                .texture = (uintptr_t)texture,
+                .vtable = (uintptr_t)vtable,
+            };
+        }
+
+        if (state.attempts < POKEMON_EMERALD_UE56_SCENE_TARGET_BOOTSTRAP_MAX_ATTEMPTS &&
+            (state.last_attempt.time_since_epoch().count() == 0 ||
+             now - state.last_attempt >= POKEMON_EMERALD_UE56_SCENE_TARGET_BOOTSTRAP_RETRY))
+        {
+            state.last_attempt = now;
+            attempt = ++state.attempts;
+            should_probe = true;
+        }
+    }
+
+    if (!should_probe) {
+        return false;
+    }
+
+    ID3D12Resource* native{};
+    D3D12_RESOURCE_DESC desc{};
+
+    if (!ue55_dx12_try_get_native_resource_direct(texture, source, &native, &desc)) {
+        SPDLOG_INFO_EVERY_N_SEC(
+            2,
+            "[PokemonEmerald][UE5.6][RT bootstrap] Attempt {}/{} did not yield a validated native scene target; retaining the strict fallback",
+            attempt,
+            POKEMON_EMERALD_UE56_SCENE_TARGET_BOOTSTRAP_MAX_ATTEMPTS);
+        return false;
+    }
+
+    ID3D12Device4* resource_device_raw{};
+    if (!get_d3d12_resource_device_guarded(native, &resource_device_raw)) {
+        SPDLOG_WARNING_EVERY_N_SEC(
+            2,
+            "[PokemonEmerald][UE5.6][RT bootstrap] Rejected native candidate {:x}: resource device was unavailable",
+            (uintptr_t)native);
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Device4> resource_device{};
+    resource_device.Attach(resource_device_raw);
+    const auto& d3d12_hook = g_framework->get_d3d12_hook();
+    const auto expected_device = d3d12_hook != nullptr ? d3d12_hook->get_device() : nullptr;
+
+    if (expected_device == nullptr || resource_device.Get() != expected_device ||
+        (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0 ||
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.Width == 0 ||
+        desc.Height == 0)
+    {
+        SPDLOG_WARNING_EVERY_N_SEC(
+            2,
+            "[PokemonEmerald][UE5.6][RT bootstrap] Rejected native candidate {:x}: device_match={} dim={} size={}x{} flags=0x{:x}",
+            (uintptr_t)native,
+            expected_device != nullptr && resource_device.Get() == expected_device,
+            (uint32_t)desc.Dimension,
+            desc.Width,
+            desc.Height,
+            (uint32_t)desc.Flags);
+        return false;
+    }
+
+    SPDLOG_INFO(
+        "[PokemonEmerald][UE5.6][RT bootstrap] Accepted FSceneViewport target on attempt {}/{}: rhi={:x} native={:x} [{}x{} fmt={} flags=0x{:x}]",
+        attempt,
+        POKEMON_EMERALD_UE56_SCENE_TARGET_BOOTSTRAP_MAX_ATTEMPTS,
+        (uintptr_t)texture,
+        (uintptr_t)native,
+        desc.Width,
+        desc.Height,
+        (uint32_t)desc.Format,
+        (uint32_t)desc.Flags);
+
+    if (out_native != nullptr) {
+        *out_native = native;
+    }
+
+    if (out_desc != nullptr) {
+        *out_desc = desc;
+    }
+
+    return true;
 }
 
 std::optional<D3D12_RESOURCE_DESC> ue55_try_get_d3d12_desc(FRHITexture2D* texture, const char* source) {
@@ -5272,6 +6296,29 @@ std::optional<uint32_t> resolve_post_init_properties_index_from_uobject(uintptr_
         return std::nullopt;
     }
 
+    // Days Gone's customized UE4.11 layout places PostInitProperties at slot
+    // 15. Its ULocalPlayer override allocates the exact FSceneViewStateReference
+    // wrappers at +0x90 and +0xB8 that the guarded owner resolver validates.
+    if (daysgone_is_current_game()) {
+        constexpr uint32_t DAYSGONE_UE411_POST_INIT_PROPERTIES_SLOT = 15;
+
+        if (validate_source_informed_post_init_slot(
+                object_vtable,
+                localplayer_vtable,
+                DAYSGONE_UE411_POST_INIT_PROPERTIES_SLOT,
+                "Days Gone UE4.11 UObject::PostInitProperties",
+                false,
+                true))
+        {
+            return DAYSGONE_UE411_POST_INIT_PROPERTIES_SLOT;
+        }
+
+        SPDLOG_WARN(
+            "[PostInitProperties] Days Gone UE4.11 slot 15 did not validate; "
+            "skipping Ghosting Fix bootstrap for safety");
+        return std::nullopt;
+    }
+
     // ProSpi 4.27.2 shipped layout validates at slot 8 in the live log/PDB path.
     // Do not force the modern UE5 slot here; if slot 8 is not provably callable,
     // fail closed instead of scanning broad/random LocalPlayer virtuals.
@@ -5634,6 +6681,93 @@ std::optional<RuntimeFunctionRange> get_runtime_function_range(uintptr_t address
     };
 }
 
+std::optional<RuntimeFunctionRange> get_canonical_runtime_function_range(uintptr_t address) {
+    constexpr uint8_t unwind_flag_ehandler = 0x1;
+    constexpr uint8_t unwind_flag_uhandler = 0x2;
+    constexpr uint8_t unwind_flag_chaininfo = 0x4;
+    constexpr uint32_t max_chain_depth = 4;
+    constexpr size_t max_combined_size = 0x4000;
+
+    DWORD64 image_base64{};
+    const auto runtime_function = RtlLookupFunctionEntry(
+        static_cast<DWORD64>(address),
+        &image_base64,
+        nullptr);
+    const auto current_range = get_runtime_function_range(address);
+
+    if (runtime_function == nullptr || image_base64 == 0 || !current_range) {
+        return std::nullopt;
+    }
+
+    auto combined = *current_range;
+    auto chained_entry = *runtime_function;
+    const auto image_base = static_cast<uintptr_t>(image_base64);
+
+    for (uint32_t depth = 0; depth <= max_chain_depth; ++depth) {
+        if (chained_entry.UnwindData == 0) {
+            return combined;
+        }
+
+        const auto unwind_address = image_base + chained_entry.UnwindData;
+        if (unwind_address < image_base || !is_readable_process_range(unwind_address, 4)) {
+            return std::nullopt;
+        }
+
+        const auto unwind_info = reinterpret_cast<const uint8_t*>(unwind_address);
+        const auto version = unwind_info[0] & 0x07;
+        const auto flags = unwind_info[0] >> 3;
+        if (version != 1) {
+            return std::nullopt;
+        }
+
+        if ((flags & unwind_flag_chaininfo) == 0) {
+            return combined;
+        }
+
+        // CHAININFO cannot be combined with an exception or unwind handler.
+        if ((flags & (unwind_flag_ehandler | unwind_flag_uhandler)) != 0 ||
+            depth == max_chain_depth)
+        {
+            return std::nullopt;
+        }
+
+        const auto unwind_code_count = static_cast<size_t>(unwind_info[2]);
+        const auto aligned_code_count = (unwind_code_count + 1) & ~size_t{1};
+        const auto chained_entry_address =
+            unwind_address + 4 + aligned_code_count * sizeof(uint16_t);
+        if (chained_entry_address < unwind_address ||
+            !is_readable_process_range(chained_entry_address, sizeof(RUNTIME_FUNCTION)))
+        {
+            return std::nullopt;
+        }
+
+        RUNTIME_FUNCTION parent_entry{};
+        std::memcpy(
+            &parent_entry,
+            reinterpret_cast<const void*>(chained_entry_address),
+            sizeof(parent_entry));
+
+        const auto parent_begin = image_base + parent_entry.BeginAddress;
+        const auto parent_end = image_base + parent_entry.EndAddress;
+        if (parent_begin < image_base || parent_end <= parent_begin ||
+            parent_begin >= combined.begin || parent_end != combined.begin ||
+            combined.end - parent_begin > max_combined_size ||
+            !is_executable_process_range(
+                parent_begin,
+                std::min<size_t>(parent_end - parent_begin, 16)))
+        {
+            return std::nullopt;
+        }
+
+        // A chained .pdata entry is a continuation of the parent function, not
+        // a callable ABI entry. Expand to the parent before installing a hook.
+        combined.begin = parent_begin;
+        chained_entry = parent_entry;
+    }
+
+    return std::nullopt;
+}
+
 bool direct_call_returns_to(uintptr_t return_address, uintptr_t expected_target) {
     constexpr size_t direct_call_size = 5;
 
@@ -5673,8 +6807,27 @@ bool indirect_virtual_call_returns_to(uintptr_t return_address, uint8_t slot_off
            call[2] == slot_offset;
 }
 
-bool has_ue426_427_begin_rendering_viewfamily_shape(const RuntimeFunctionRange& function) {
-    if (function.size() < 0x200 || function.size() > 0x4000 ||
+constexpr uint8_t UE425_FRAME_NUMBER_OFFSET = 0x3C;
+constexpr uint8_t MEDIUM_UE425PLUS_FRAME_NUMBER_OFFSET = 0x44;
+constexpr uint8_t UE426_427_FRAME_NUMBER_OFFSET = 0x5C;
+
+bool has_source_validated_ue4_begin_rendering_viewfamily_shape(
+    const RuntimeFunctionRange& function,
+    uint8_t frame_number_offset)
+{
+    // Some optimized UE4.25 builds split this function at the extension loop.
+    // The chained parent plus callback region can be smaller than 0x200 while
+    // still containing both source-derived signatures.
+    constexpr size_t UE425_MIN_RENDERER_SIZE = 0x180;
+    constexpr size_t DEFAULT_MIN_RENDERER_SIZE = 0x200;
+    const auto uses_ue425_layout =
+        frame_number_offset == UE425_FRAME_NUMBER_OFFSET ||
+        frame_number_offset == MEDIUM_UE425PLUS_FRAME_NUMBER_OFFSET;
+    const auto minimum_size = uses_ue425_layout
+        ? UE425_MIN_RENDERER_SIZE
+        : DEFAULT_MIN_RENDERER_SIZE;
+
+    if (function.size() < minimum_size || function.size() > 0x4000 ||
         !is_readable_process_range(function.begin, function.size()))
     {
         return false;
@@ -5705,10 +6858,13 @@ bool has_ue426_427_begin_rendering_viewfamily_shape(const RuntimeFunctionRange& 
             continue;
         }
 
-        // UE4.26/4.27 FSceneViewFamily::FrameNumber is a uint32 at +0x5c.
-        // Accept any compiler-selected base/source register, but reject a
-        // REX.W qword store.
-        if (opcode == 0x89 && (rex & 0x08) == 0 && bytes[displacement_index] == 0x5C) {
+        // Stock/SHCO UE4.25 uses +0x3c, The Medium's UE4.25Plus fork
+        // uses +0x44, and UE4.26/4.27 use +0x5c. Accept any compiler-selected
+        // base/source register, but reject a REX.W qword store.
+        if (opcode == 0x89 &&
+            (rex & 0x08) == 0 &&
+            bytes[displacement_index] == frame_number_offset)
+        {
             writes_frame_number = true;
         }
 
@@ -5729,8 +6885,9 @@ bool has_ue426_427_begin_rendering_viewfamily_shape(const RuntimeFunctionRange& 
     return false;
 }
 
-std::optional<RuntimeFunctionRange> get_ue426_427_begin_rendering_viewfamily_range(
-    uintptr_t callback_return)
+std::optional<RuntimeFunctionRange> get_source_validated_ue4_begin_rendering_viewfamily_range(
+    uintptr_t callback_return,
+    uint8_t frame_number_offset)
 {
     constexpr uint8_t unwind_flag_chaininfo = 0x4;
     constexpr uint32_t max_chain_depth = 4;
@@ -5755,7 +6912,10 @@ std::optional<RuntimeFunctionRange> get_ue426_427_begin_rendering_viewfamily_ran
     const auto image_base = static_cast<uintptr_t>(image_base64);
 
     for (uint32_t depth = 0; depth <= max_chain_depth; ++depth) {
-        if (has_ue426_427_begin_rendering_viewfamily_shape(combined)) {
+        if (has_source_validated_ue4_begin_rendering_viewfamily_shape(
+                combined,
+                frame_number_offset))
+        {
             return combined;
         }
 
@@ -5845,25 +7005,39 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
         nullptr);
 
     const auto game_module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto source_validated_ue4 = is_ue_4_26_runtime() || is_ue_4_27_runtime();
+    const auto source_validated_ue425 = is_ue_4_25_runtime();
+    const auto source_validated_ue426_427 = is_ue_4_26_runtime() || is_ue_4_27_runtime();
+    const auto source_validated_ue4 = source_validated_ue425 || source_validated_ue426_427;
+    const auto medium_ue425plus = source_validated_ue425 && medium_is_current_game();
+    const auto source_frame_number_offset = source_validated_ue425
+        ? (medium_ue425plus
+            ? MEDIUM_UE425PLUS_FRAME_NUMBER_OFFSET
+            : UE425_FRAME_NUMBER_OFFSET)
+        : UE426_427_FRAME_NUMBER_OFFSET;
+    const auto source_runtime_label = medium_ue425plus
+        ? "Medium UE4.25Plus"
+        : (source_validated_ue425 ? "UE4.25" : "UE4.26/4.27");
     std::optional<uintptr_t> best_candidate{};
     int best_score = std::numeric_limits<int>::min();
 
-    // UE4.26/4.27 calls slot 5 directly from FRendererModule::
+    // UE4.25-4.27 call slot 5 directly from FRendererModule::
     // BeginRenderingViewFamily. The callback's own return address is stronger
     // evidence than reconstructing that frame through RtlCaptureStackBackTrace.
     if (source_validated_ue4 && direct_callback_return != 0) {
         const auto direct_segment = get_runtime_function_range(direct_callback_return);
         const auto direct_candidate =
-            get_ue426_427_begin_rendering_viewfamily_range(direct_callback_return);
+            get_source_validated_ue4_begin_rendering_viewfamily_range(
+                direct_callback_return,
+                source_frame_number_offset);
         const auto direct_candidate_valid =
             direct_candidate.has_value() &&
             direct_candidate->image_base == game_module;
 
         if (direct_candidate_valid) {
             SPDLOG_INFO(
-                "[UE4.26/4.27][ViewFamilySelector] Resolved source-validated callback caller "
+                "[{}][ViewFamilySelector] Resolved source-validated callback caller "
                 "target={:x} size={:x} return={:x}",
+                source_runtime_label,
                 direct_candidate->begin,
                 direct_candidate->size(),
                 direct_callback_return);
@@ -5871,8 +7045,9 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
         }
 
         SPDLOG_WARN_ONCE(
-            "[UE4.26/4.27][ViewFamilySelector] Rejected callback caller return={:x} "
+            "[{}][ViewFamilySelector] Rejected callback caller return={:x} "
             "function={:x} size={:x} game_module={} slot5_call={} renderer_shape={}",
+            source_runtime_label,
             direct_callback_return,
             direct_segment ? direct_segment->begin : 0,
             direct_segment ? direct_segment->size() : 0,
@@ -5886,8 +7061,9 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
     // Validate that wrapper's exact direct CALL instead of guessing from the
     // first captured frame.
     for (uint32_t i = 1; !source_validated_ue4 && i + 1 < depth && i <= max_renderer_stack_index; ++i) {
-        const auto callee = get_runtime_function_range(stack[i]);
-        const auto caller = get_runtime_function_range(stack[i + 1]);
+        const auto callee_segment = get_runtime_function_range(stack[i]);
+        const auto callee = get_canonical_runtime_function_range(stack[i]);
+        const auto caller = get_canonical_runtime_function_range(stack[i + 1]);
 
         if (!callee || !caller || callee->begin == caller->begin ||
             callee->image_base != game_module || caller->image_base != game_module ||
@@ -5911,6 +7087,12 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
         if (score > best_score) {
             best_score = score;
             best_candidate = callee->begin;
+            if (callee_segment && callee_segment->begin != callee->begin) {
+                SPDLOG_INFO(
+                    "[ViewFamilySelector] Canonicalized chained renderer callee segment={:x} target={:x}",
+                    callee_segment->begin,
+                    callee->begin);
+            }
             SPDLOG_INFO(
                 "[ViewFamilySelector] BeginRenderingViewFamilies candidate target={:x} size={:x} "
                 "wrapper={:x} wrapper_size={:x} return={:x} stack_index={} score={}",
@@ -5929,13 +7111,22 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
         // while optimized newer builds can inline away the small plural wrapper.
         // The first substantial game-module frame above this view-extension
         // callback is the renderer entry point itself.
-        constexpr size_t min_renderer_size = 0x200;
+        constexpr size_t UE425_MIN_RENDERER_SIZE = 0x180;
+        constexpr size_t DEFAULT_MIN_RENDERER_SIZE = 0x200;
+        const auto min_renderer_size = source_validated_ue425
+            ? UE425_MIN_RENDERER_SIZE
+            : DEFAULT_MIN_RENDERER_SIZE;
         constexpr size_t max_renderer_size = 0x4000;
 
         for (uint32_t i = 1; i < depth && i <= max_renderer_stack_index; ++i) {
-            const auto candidate = source_validated_ue4
-                ? get_ue426_427_begin_rendering_viewfamily_range(stack[i])
+            const auto candidate_segment = source_validated_ue4
+                ? std::optional<RuntimeFunctionRange>{}
                 : get_runtime_function_range(stack[i]);
+            const auto candidate = source_validated_ue4
+                ? get_source_validated_ue4_begin_rendering_viewfamily_range(
+                    stack[i],
+                    source_frame_number_offset)
+                : get_canonical_runtime_function_range(stack[i]);
             if (!candidate || candidate->image_base != game_module ||
                 candidate->size() < min_renderer_size ||
                 candidate->size() > max_renderer_size)
@@ -5945,7 +7136,9 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
 
             if (source_validated_ue4 &&
                 (!indirect_virtual_call_returns_to(stack[i], 0x28) ||
-                 !has_ue426_427_begin_rendering_viewfamily_shape(*candidate)))
+                 !has_source_validated_ue4_begin_rendering_viewfamily_shape(
+                     *candidate,
+                     source_frame_number_offset)))
             {
                 continue;
             }
@@ -5953,13 +7146,20 @@ std::optional<uintptr_t> resolve_begin_rendering_viewfamilies_from_stack(
             best_candidate = candidate->begin;
             if (source_validated_ue4) {
                 SPDLOG_INFO(
-                    "[UE4.26/4.27][ViewFamilySelector] Resolved source-validated direct "
+                    "[{}][ViewFamilySelector] Resolved source-validated direct "
                     "BeginRenderingViewFamily entry target={:x} size={:x} return={:x} stack_index={}",
+                    source_runtime_label,
                     candidate->begin,
                     candidate->size(),
                     stack[i],
                     i);
             } else {
+                if (candidate_segment && candidate_segment->begin != candidate->begin) {
+                    SPDLOG_INFO(
+                        "[ViewFamilySelector] Canonicalized chained renderer frame segment={:x} target={:x}",
+                        candidate_segment->begin,
+                        candidate->begin);
+                }
                 SPDLOG_INFO(
                     "[ViewFamilySelector] Resolved direct BeginRenderingViewFamily entry from stack "
                     "target={:x} size={:x} return={:x} stack_index={}",
@@ -5979,21 +7179,43 @@ bool validate_dune_begin_rendering_viewfamilies_target(uintptr_t target) {
     const auto game_module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto function = get_runtime_function_range(target);
 
-    if (!function || function->begin != target || function->image_base != game_module || function->size() < 0x200) {
+    // Current Dune builds split this renderer body across adjacent unwind
+    // ranges; the entry range is 0x1f1 bytes even though execution continues
+    // into the next range. Only the entry prologue is needed for the ABI proof.
+    constexpr size_t minimum_entry_size = 0x40;
+    constexpr size_t maximum_entry_size = 0x4000;
+    if (!function || function->begin != target || function->image_base != game_module ||
+        function->size() < minimum_entry_size || function->size() > maximum_entry_size)
+    {
         return false;
     }
 
     // Dune's UE5.2 implementation consumes the TArrayView passed in R8 at the
     // start of the plural function: its data pointer is at +0 and count at +8.
-    // Requiring both reads prevents an exact-wrapper false positive from ever
-    // being installed as a Native Stereo Fix hook.
+    // The retail build reads those fields directly from R8, while the public
+    // test build first preserves R8 in RDI. Require the alias assignment and
+    // both field reads for the latter so either compiler allocation proves the
+    // same ABI without weakening the exact-wrapper resolver.
     const auto validation_size = std::min<size_t>(function->size(), 0x100);
-    return utility::scan(target, validation_size, "4D 8B 20").has_value() &&
-           utility::scan(target, validation_size, "49 63 40 08").has_value();
+    const auto direct_data_read = utility::scan(target, validation_size, "4D 8B 20");
+    const auto direct_count_read = utility::scan(target, validation_size, "49 63 40 08");
+    const auto direct_r8_layout =
+        direct_data_read.has_value() && direct_count_read.has_value() &&
+        *direct_data_read < *direct_count_read;
+    const auto preserve_r8_in_rdi = utility::scan(target, validation_size, "49 8B F8");
+    const auto preserved_data_read = utility::scan(target, validation_size, "4C 8B 27");
+    const auto preserved_count_read = utility::scan(target, validation_size, "48 63 47 08");
+    const auto preserved_rdi_layout =
+        preserve_r8_in_rdi.has_value() && preserved_data_read.has_value() &&
+        preserved_count_read.has_value() &&
+        *preserve_r8_in_rdi < *preserved_data_read &&
+        *preserved_data_read < *preserved_count_read;
+
+    return direct_r8_layout || preserved_rdi_layout;
 }
 
 std::optional<uintptr_t> resolve_dune_begin_rendering_viewfamilies() {
-    if (!dune_awakening_is_current_game()) {
+    if (!dune_native_fix_renderer_resolver_is_current_game()) {
         return std::nullopt;
     }
 
@@ -6047,6 +7269,147 @@ std::optional<uintptr_t> resolve_dune_begin_rendering_viewfamilies() {
 
         SPDLOG_INFO(
             "[Dune][NativeStereoFix] Resolved verified BeginRenderingViewFamilies wrapper={:x} target={:x}",
+            *wrapper,
+            target);
+        return target;
+    }();
+
+    return resolved;
+}
+
+bool validate_dune_renderer_view_family(
+    sdk::FSceneViewFamily* family,
+    uintptr_t expected_vtable,
+    uintptr_t actual_vtable)
+{
+    if (!dune_native_fix_renderer_resolver_is_current_game() ||
+        family == nullptr || expected_vtable == 0 || actual_vtable == 0 ||
+        actual_vtable == expected_vtable || !sdk::FSceneViewFamily::has_offsets())
+    {
+        return false;
+    }
+
+    const auto executable = utility::get_executable();
+    if (executable == nullptr ||
+        !is_readable_process_range(actual_vtable, sizeof(uintptr_t)) ||
+        utility::get_module_within(reinterpret_cast<void*>(actual_vtable)).value_or(nullptr) != executable)
+    {
+        return false;
+    }
+
+    uintptr_t first_virtual{};
+    std::memcpy(&first_virtual, reinterpret_cast<const void*>(actual_vtable), sizeof(first_virtual));
+    if (!is_executable_process_range(first_virtual, 1) ||
+        utility::get_module_within(reinterpret_cast<void*>(first_virtual)).value_or(nullptr) != executable)
+    {
+        return false;
+    }
+
+    auto* const views = family->get_views();
+    constexpr int32_t max_sane_views = 16;
+    if (views == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(views), sizeof(*views)) ||
+        views->count <= 0 || views->count > max_sane_views ||
+        views->capacity < views->count || views->data == nullptr ||
+        !is_readable_process_range(
+            reinterpret_cast<uintptr_t>(views->data),
+            sizeof(sdk::FSceneView*) * static_cast<size_t>(views->count)))
+    {
+        return false;
+    }
+
+    // Dune reaches this entry with base FSceneViewFamily objects as well as
+    // renderer-owned family variants. Their vtables can differ while retaining
+    // the validated base layout and per-view Family back-links.
+    return family->get_render_target() != nullptr &&
+           family->get_scene_interface() != nullptr &&
+           sdk::FSceneViewFamily::validate_views(family, views, max_sane_views);
+}
+
+bool validate_pokemon_emerald_begin_rendering_viewfamilies_target(uintptr_t target) {
+    const auto game_module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto function = get_runtime_function_range(target);
+
+    if (!function || function->begin != target || function->image_base != game_module ||
+        function->size() < 0x200 || function->size() > 0x4000)
+    {
+        return false;
+    }
+
+    // Pokemon Emerald's UE5.6 plural renderer preserves the TArrayView passed
+    // in R8, then reads its data pointer and signed count from +0/+8. Require
+    // all three operations so the exact wrapper cannot resolve another large
+    // renderer function with an incompatible first argument.
+    const auto validation_size = std::min<size_t>(function->size(), 0x100);
+    return utility::scan(target, validation_size, "4D 8B E0").has_value() &&
+           utility::scan(target, validation_size, "49 8B 3C 24").has_value() &&
+           utility::scan(target, validation_size, "49 63 5C 24 08").has_value();
+}
+
+std::optional<uintptr_t> resolve_pokemon_emerald_begin_rendering_viewfamilies() {
+    if (!pokemon_emerald_is_current_game() || !is_ue_5_6_dx12_backend()) {
+        return std::nullopt;
+    }
+
+    static const auto resolved = []() -> std::optional<uintptr_t> {
+        const auto module = utility::get_executable();
+
+        // Matching UE5.6.1 source and the game's BinFoldV3 PDB identify this as
+        // FRendererModule::BeginRenderingViewFamily. It constructs a one-item
+        // TArrayView and directly calls the plural entry used by Native Fix.
+        constexpr auto wrapper_pattern =
+            "48 83 EC 38 C7 44 24 28 01 00 00 00 48 8D 44 24 50 "
+            "48 89 44 24 20 0F 28 44 24 20 4C 89 44 24 50 "
+            "4C 8D 44 24 20 66 0F 7F 44 24 20 E8 ? ? ? ? "
+            "48 83 C4 38 C3";
+        constexpr size_t call_offset = 0x2B;
+
+        const auto wrapper = utility::scan(module, wrapper_pattern);
+        if (!wrapper) {
+            SPDLOG_ERROR(
+                "[PokemonEmerald][UE5.6][NativeStereoFix] Refusing activation: "
+                "the verified singular BeginRenderingViewFamily wrapper was not found");
+            return std::nullopt;
+        }
+
+        const auto wrapper_function = get_runtime_function_range(*wrapper);
+        if (!wrapper_function || wrapper_function->begin != *wrapper ||
+            wrapper_function->image_base != reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) ||
+            wrapper_function->size() > 0x80)
+        {
+            SPDLOG_ERROR(
+                "[PokemonEmerald][UE5.6][NativeStereoFix] Refusing activation: "
+                "wrapper at {:x} failed function-boundary validation",
+                *wrapper);
+            return std::nullopt;
+        }
+
+        const auto call_address = *wrapper + call_offset;
+        if (!is_readable_process_range(call_address, 5) ||
+            *reinterpret_cast<const uint8_t*>(call_address) != 0xE8)
+        {
+            SPDLOG_ERROR(
+                "[PokemonEmerald][UE5.6][NativeStereoFix] Refusing activation: "
+                "wrapper at {:x} has no verified direct CALL",
+                *wrapper);
+            return std::nullopt;
+        }
+
+        int32_t displacement{};
+        std::memcpy(&displacement, reinterpret_cast<const void*>(call_address + 1), sizeof(displacement));
+        const auto target = static_cast<uintptr_t>(call_address + 5 + displacement);
+
+        if (!validate_pokemon_emerald_begin_rendering_viewfamilies_target(target)) {
+            SPDLOG_ERROR(
+                "[PokemonEmerald][UE5.6][NativeStereoFix] Refusing activation: "
+                "plural target {:x} failed TArrayView validation",
+                target);
+            return std::nullopt;
+        }
+
+        SPDLOG_INFO(
+            "[PokemonEmerald][UE5.6][NativeStereoFix] Resolved verified "
+            "BeginRenderingViewFamilies wrapper={:x} target={:x}",
             *wrapper,
             target);
         return target;
@@ -6673,6 +8036,65 @@ bool ghosting_resolve_direct_view_state_slots(
     sdk::FSceneViewStateInterface* right_state,
     GhostingFixOwnerCandidate& out)
 {
+    if (daysgone_is_current_game()) {
+        constexpr uintptr_t FIRST_REFERENCE_OFFSET = 0x90;
+        constexpr uintptr_t SECOND_REFERENCE_OFFSET = 0xB8;
+        constexpr uint32_t REFERENCE_STRIDE =
+            static_cast<uint32_t>(SECOND_REFERENCE_OFFSET - FIRST_REFERENCE_OFFSET);
+        constexpr size_t STORAGE_END_OFFSET = SECOND_REFERENCE_OFFSET + (2 * sizeof(uintptr_t));
+
+        const auto first = local_player_address + FIRST_REFERENCE_OFFSET;
+        const auto second = local_player_address + SECOND_REFERENCE_OFFSET;
+        uintptr_t first_vtable{};
+        uintptr_t second_vtable{};
+        uintptr_t first_virtual{};
+        uintptr_t first_state{};
+        uintptr_t second_state{};
+
+        if (is_readable_process_range(local_player_address, STORAGE_END_OFFSET) &&
+            safe_read_value(first, first_vtable) &&
+            first_vtable != 0 &&
+            safe_read_value(second, second_vtable) &&
+            first_vtable == second_vtable &&
+            safe_read_value(first_vtable, first_virtual) &&
+            first_virtual != 0 &&
+            is_executable_process_range(first_virtual, 1) &&
+            safe_read_value(first + sizeof(uintptr_t), first_state) &&
+            safe_read_value(second + sizeof(uintptr_t), second_state))
+        {
+            const auto left = reinterpret_cast<uintptr_t>(left_state);
+            const auto right = reinterpret_cast<uintptr_t>(right_state);
+            const bool natural_order = first_state == left && second_state == right;
+            const bool swapped_order = first_state == right && second_state == left;
+
+            if (natural_order || swapped_order) {
+                out.view_states_header = 0;
+                out.view_states_data = first;
+                out.view_states_count = 2;
+                out.view_states_capacity = 2;
+                out.view_state_stride = REFERENCE_STRIDE;
+                out.view_state_reference_vtable = first_vtable;
+                out.eye_state_slot[0] = natural_order
+                    ? first + sizeof(uintptr_t)
+                    : second + sizeof(uintptr_t);
+                out.eye_state_slot[1] = natural_order
+                    ? second + sizeof(uintptr_t)
+                    : first + sizeof(uintptr_t);
+                out.view_states_are_array = false;
+
+                SPDLOG_INFO_ONCE(
+                    "[GhostingFix][DaysGone] Validated exact UE4.11 LocalPlayer "
+                    "ViewState/StereoViewState storage owner={:x} first=+0x{:x} "
+                    "second=+0x{:x} stride=0x{:x}",
+                    local_player_address,
+                    FIRST_REFERENCE_OFFSET,
+                    SECOND_REFERENCE_OFFSET,
+                    REFERENCE_STRIDE);
+                return true;
+            }
+        }
+    }
+
     if (controller_id_data <= local_player_address + sdk::UObjectBase::get_class_size()) {
         return false;
     }
@@ -6835,7 +8257,22 @@ bool ghosting_resolve_current_owner(
             viewport_override_data = 0;
         }
 
-        if (controller_id_data == 0) {
+        GhostingFixOwnerCandidate candidate{};
+        bool found_view_states = false;
+
+        // Days Gone's UE4.11 fork does not expose ControllerId through the
+        // reflected LocalPlayer layout. Resolve its two exact, BN-validated
+        // scene-state references before relying on reflected boundaries.
+        if (daysgone_is_current_game()) {
+            found_view_states = ghosting_resolve_direct_view_state_slots(
+                local_player_address,
+                controller_id_data,
+                left_state,
+                right_state,
+                candidate);
+        }
+
+        if (!found_view_states && controller_id_data == 0) {
             diagnostic.failure = GhostingOwnerResolveFailure::ViewStateStorage;
             continue;
         }
@@ -6873,13 +8310,13 @@ bool ghosting_resolve_current_owner(
             }
         }
 
-        GhostingFixOwnerCandidate candidate{};
-        bool found_view_states = false;
-        for (const auto header : view_state_headers) {
-            candidate = {};
-            if (ghosting_resolve_view_state_slots(header, left_state, right_state, candidate)) {
-                found_view_states = true;
-                break;
+        if (!found_view_states) {
+            for (const auto header : view_state_headers) {
+                candidate = {};
+                if (ghosting_resolve_view_state_slots(header, left_state, right_state, candidate)) {
+                    found_view_states = true;
+                    break;
+                }
             }
         }
 
@@ -7265,24 +8702,34 @@ bool is_using_double_precision(uintptr_t addr) {
     bool result = false;
 
     utility::exhaustive_decode((uint8_t*)addr, 50, [&](INSTRUX& ix, uintptr_t ip) -> utility::ExhaustionResult {
-        if (std::string_view{ix.Mnemonic}.starts_with("CALL")) {
+        const std::string_view mnemonic{ix.Mnemonic};
+
+        if (mnemonic.starts_with("CALL")) {
             return utility::ExhaustionResult::STEP_OVER;
         }
 
-        if (ix.Instruction == ND_INS_MOVSD && ix.Operands[0].Type == ND_OP_MEM && ix.Operands[1].Type == ND_OP_REG) {
-            SPDLOG_INFO("[UE5 Detected] Detected Double precision MOVSD at {:x}", (uintptr_t)ip);
+        // A store of a scalar double to memory is the strongest possible signal: it means
+        // the struct field being written is 8 bytes wide.
+        if ((ix.Instruction == ND_INS_MOVSD || ix.Instruction == ND_INS_VMOVSD) &&
+            ix.Operands[0].Type == ND_OP_MEM && ix.Operands[1].Type == ND_OP_REG)
+        {
+            SPDLOG_INFO("[UE5 Detected] Detected Double precision store ({}) at {:x}", mnemonic, (uintptr_t)ip);
             result = true;
             return utility::ExhaustionResult::BREAK;
         }
 
-        if (ix.Instruction == ND_INS_ADDSD) {
-            SPDLOG_INFO("[UE5 Detected] Detected Double precision ADDSD at {:x}", (uintptr_t)ip);
+        if (ix.Instruction == ND_INS_ADDSD || ix.Instruction == ND_INS_VADDSD) {
+            SPDLOG_INFO("[UE5 Detected] Detected Double precision arithmetic ({}) at {:x}", mnemonic, (uintptr_t)ip);
             result = true;
             return utility::ExhaustionResult::BREAK;
         }
 
         return utility::ExhaustionResult::CONTINUE;
     });
+
+    if (!result) {
+        SPDLOG_INFO("No double precision usage found at {:x}", addr);
+    }
 
     return result;
 }
@@ -10141,6 +11588,11 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
         SPDLOG_WARN("[Windrose][R5] Forcing UE5.6 double-precision view math because function-scan detection missed it");
     }
 
+    // Getting this wrong silently corrupts every FVector/FRotator/FMatrix written back into
+    // the engine, so state the verdict outright rather than leaving it implicit in the
+    // absence of a detection message.
+    SPDLOG_INFO("Double precision (LWC) view math: {}", m_has_double_precision ? "YES" : "NO");
+
     {
         m_adjust_view_rect_hook = safetyhook::create_inline((void*)adjust_view_rect_func, adjust_view_rect);
         m_calculate_stereo_view_offset_hook_inline = safetyhook::create_inline((void*)stereo_view_offset_func, calculate_stereo_view_offset);
@@ -12052,9 +13504,12 @@ void FFakeStereoRenderingHook::try_adopt_scene_viewport_render_target(sdk::FView
     }
 
     const bool dune_viewport_adoption = dune_awakening_is_current_game();
+    const bool pokemon_emerald_ue56_dx12_viewport_adoption =
+        pokemon_emerald_is_current_game() && is_ue_5_6_dx12_backend();
     const bool allow_scene_viewport_rt_adoption =
         dune_viewport_adoption || ue58_viewport_adoption ||
-        naruto_ue416_dx11_viewport_adoption || dead_island_2_ue425_dx12_viewport_adoption;
+        naruto_ue416_dx11_viewport_adoption || dead_island_2_ue425_dx12_viewport_adoption ||
+        pokemon_emerald_ue56_dx12_viewport_adoption;
     const auto log_prefix = dune_viewport_adoption
         ? "[Dune][RT]"
         : (ue58_viewport_adoption
@@ -12063,7 +13518,9 @@ void FFakeStereoRenderingHook::try_adopt_scene_viewport_render_target(sdk::FView
                 ? "[Naruto][UE4.16][RT]"
                 : (dead_island_2_ue425_dx12_viewport_adoption
                     ? "[DeadIsland2][UE4.25][RT]"
-                    : "[SHf]")));
+                    : (pokemon_emerald_ue56_dx12_viewport_adoption
+                        ? "[PokemonEmerald][UE5.6][RT]"
+                        : "[SHf]"))));
     const auto source_name = source != nullptr ? source : "<unknown>";
     const bool everspace2_direct_observation =
         everspace2_is_current_game() && is_ue_5_5_dx12_backend();
@@ -12142,13 +13599,18 @@ void FFakeStereoRenderingHook::try_adopt_scene_viewport_render_target(sdk::FView
         naruto_ue416_dx11_viewport_adoption && is_naruto_post_draw;
     const bool is_dead_island_2_viewport_refresh =
         dead_island_2_ue425_dx12_viewport_adoption && is_dead_island_2_post_draw;
+    const bool is_pokemon_emerald_viewport_refresh =
+        pokemon_emerald_ue56_dx12_viewport_adoption &&
+        source != nullptr &&
+        std::strcmp(source, "UGameViewportClient::Draw viewport") == 0;
 
     if (!everspace2_direct_observation &&
         current_target != nullptr &&
         !is_dune_viewport_refresh &&
         !is_ue58_viewport_refresh &&
         !is_naruto_viewport_refresh &&
-        !is_dead_island_2_viewport_refresh)
+        !is_dead_island_2_viewport_refresh &&
+        !is_pokemon_emerald_viewport_refresh)
     {
         return;
     }
@@ -12215,6 +13677,12 @@ void FFakeStereoRenderingHook::try_adopt_scene_viewport_render_target(sdk::FView
 
         shf_probe_scene_viewport_memory(viewport, source, nullptr);
         SPDLOG_INFO_EVERY_N_SEC(2, "{} FSceneViewport render target is not available yet from {}", log_prefix, source_name);
+        return;
+    }
+
+    // The wrapper already exposes its current native resource dynamically, so
+    // only re-run the guarded bootstrap when the engine rotates the wrapper.
+    if (pokemon_emerald_ue56_dx12_viewport_adoption && candidate == current_target) {
         return;
     }
 
@@ -12287,8 +13755,17 @@ void FFakeStereoRenderingHook::try_adopt_scene_viewport_render_target(sdk::FView
         native_resource = everspace2_candidate->native_resource.Get();
         desc = everspace2_candidate->desc;
     } else if (is_ue_5_6_dx12_backend()) {
-        if (!ue56_dx12_try_get_native_resource(candidate, source, &native_resource, &desc)) {
-            SPDLOG_WARNING_EVERY_N_SEC(2, "[UE5.6][RT] Failing closed for FSceneViewport render target from {}; waiting for D3D12 texture/backbuffer hooks", source);
+        const bool is_known_viewport_source =
+            source != nullptr && std::string_view{source} == "UGameViewportClient::Draw viewport";
+        const bool is_pokemon_emerald_viewport_bootstrap =
+            pokemon_emerald_is_current_game() &&
+            is_known_viewport_source;
+        const bool discovered =
+            is_pokemon_emerald_viewport_bootstrap
+                ? pokemon_emerald_ue56_try_bootstrap_scene_target(candidate, source, &native_resource, &desc)
+                : ue56_dx12_try_get_native_resource(candidate, source, &native_resource, &desc);
+
+        if (!discovered) {            SPDLOG_WARNING_EVERY_N_SEC(2, "[UE5.6][RT] Failing closed for FSceneViewport render target from {}; waiting for D3D12 texture/backbuffer hooks", source);
             return;
         }
     } else if (validated_dx11_viewport_adoption) {
@@ -13021,6 +14498,17 @@ struct SceneViewExtensionAnalyzer {
     static constexpr uint32_t UE426_427_VIEW_MODE_OFFSET = 0x10;
     static constexpr uint32_t UE426_427_RENDER_TARGET_OFFSET = 0x18;
 
+    // Dune is a UE5.2.1 build. These slots and family offsets are fixed by the
+    // matching source and independently confirmed by both runtime logs.
+    static constexpr uint32_t DUNE_UE52_BEGIN_RENDER_VIEWFAMILY_INDEX = 5;
+    static constexpr uint32_t DUNE_UE52_PRE_RENDER_VIEWFAMILY_INDEX = 6;
+    static constexpr uint32_t DUNE_UE52_PRE_RENDER_VIEW_INDEX = 7;
+    static constexpr uint32_t DUNE_UE52_IS_ACTIVE_INTERNAL_INDEX = 22;
+    static constexpr uint32_t DUNE_UE52_VIEWS_OFFSET = 0x8;
+    static constexpr uint32_t DUNE_UE52_RENDER_TARGET_OFFSET = 0x20;
+    static constexpr uint32_t DUNE_UE52_SCENE_OFFSET = 0x28;
+    static constexpr uint32_t DUNE_UE52_FRAME_NUMBER_OFFSET = 0x84;
+
     static bool validate_cached_discovery(void** original_vtable, const nlohmann::json& cached);
     static bool try_apply_cached_discovery(void** original_vtable);
     static void save_cached_discovery();
@@ -13188,6 +14676,35 @@ struct SceneViewExtensionAnalyzer {
         return true;
     }
 
+    static bool try_apply_dune_ue52_source_layout(uint32_t observed_is_active_index) {
+        if (!dune_native_fix_renderer_resolver_is_current_game() ||
+            index_0_called ||
+            observed_is_active_index != DUNE_UE52_IS_ACTIVE_INTERNAL_INDEX ||
+            has_found_begin_render_viewfamily)
+        {
+            return false;
+        }
+
+        has_found_begin_render_viewfamily = true;
+        begin_render_viewfamily_index = DUNE_UE52_BEGIN_RENDER_VIEWFAMILY_INDEX;
+        pre_render_viewfamily_renderthread_index = DUNE_UE52_PRE_RENDER_VIEWFAMILY_INDEX;
+        frame_count_offset = DUNE_UE52_FRAME_NUMBER_OFFSET;
+        sdk::FSceneViewFamily::set_frame_count_offset(frame_count_offset);
+
+        SPDLOG_INFO(
+            "[Dune][ViewExtension] Applied source-validated UE5.2 mapping "
+            "BeginRenderViewFamily={} PreRenderViewFamily_RenderThread={} "
+            "PreRenderView_RenderThread={} IsActiveThisFrame_Internal={} FrameNumber=0x{:x}",
+            begin_render_viewfamily_index,
+            pre_render_viewfamily_renderthread_index,
+            DUNE_UE52_PRE_RENDER_VIEW_INDEX,
+            observed_is_active_index,
+            frame_count_offset);
+
+        setup_view_extension_hook();
+        return true;
+    }
+
     template<int N>
     static bool analysis_dummy_stage1(ISceneViewExtension* extension, uintptr_t a2, uintptr_t a3, uintptr_t a4) {
         if (N == 0) {
@@ -13232,6 +14749,12 @@ struct SceneViewExtensionAnalyzer {
 
             has_found_is_active_this_frame_index = true;
             is_active_this_frame_index = max_index;
+
+            // Dune's UE5.2 interface layout is known. Bypass the generic
+            // frame-counter heuristic, which can confuse PreRenderView's
+            // FSceneView argument (or stale registers from GetPriority) for an
+            // FSceneViewFamily and install an ABI-incompatible callback.
+            try_apply_dune_ue52_source_layout(max_index);
         } else {
             if (functions[N].call_count == 1) {
                 SPDLOG_INFO("[Stage 1] ISceneViewExtension Index {} called for the first time!", N);
@@ -13244,6 +14767,12 @@ struct SceneViewExtensionAnalyzer {
     template<int N>
     static bool analysis_dummy_stage2(ISceneViewExtension* extension, uintptr_t a2, uintptr_t a3, uintptr_t a4) {
         if (has_found_begin_render_viewfamily) {
+            return false;
+        }
+
+        if (dune_native_fix_renderer_resolver_is_current_game() && has_found_is_active_this_frame_index) {
+            SPDLOG_WARN_ONCE(
+                "[Dune][ViewExtension] Source mapping validation failed; refusing unsafe heuristic callback discovery");
             return false;
         }
 
@@ -13410,8 +14939,28 @@ struct SceneViewExtensionAnalyzer {
                 setup_view_family_index + 3);
         }
 
-        // PreRenderViewFamily_RenderThread
-        g_view_extension_vtable[pre_render_viewfamily_renderthread_index] = (uintptr_t)&FFakeStereoRenderingHook::pre_render_viewfamily_renderthread;
+        const bool use_dune_ue52_source_callbacks =
+            dune_native_fix_renderer_resolver_is_current_game() &&
+            !index_0_called &&
+            begin_render_viewfamily_index == DUNE_UE52_BEGIN_RENDER_VIEWFAMILY_INDEX &&
+            pre_render_viewfamily_renderthread_index == DUNE_UE52_PRE_RENDER_VIEWFAMILY_INDEX &&
+            is_active_this_frame_index == DUNE_UE52_IS_ACTIVE_INTERNAL_INDEX &&
+            frame_count_offset == DUNE_UE52_FRAME_NUMBER_OFFSET;
+
+        // Prefer the family callback, but also install a correctly typed
+        // per-view adapter. Dune has been observed calling slot 7 without slot
+        // 6 on some systems; the adapter resolves and validates the owning
+        // family instead of treating FSceneView as FSceneViewFamily.
+        g_view_extension_vtable[pre_render_viewfamily_renderthread_index] =
+            (uintptr_t)&FFakeStereoRenderingHook::pre_render_viewfamily_renderthread;
+        if (use_dune_ue52_source_callbacks) {
+            g_view_extension_vtable[DUNE_UE52_PRE_RENDER_VIEW_INDEX] =
+                (uintptr_t)&FFakeStereoRenderingHook::pre_render_view_renderthread;
+            SPDLOG_INFO(
+                "[Dune][ViewExtension] Installed source-typed render-thread callbacks at family slot {} and view slot {}",
+                pre_render_viewfamily_renderthread_index,
+                DUNE_UE52_PRE_RENDER_VIEW_INDEX);
+        }
 
         SPDLOG_INFO("Done setting up BeginRenderViewFamily hook!");
     }
@@ -13872,6 +15421,105 @@ bool FFakeStereoRenderingHook::bind_ghosting_fix_owner(GhostingFixPair& pair, co
     return true;
 }
 
+bool FFakeStereoRenderingHook::orient_daysgone_ghosting_fix_pair_from_owner(GhostingFixPair& pair) {
+    if (!daysgone_is_current_game() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx11() ||
+        !ghosting_is_valid_scene_state(pair.eye_state[0]) ||
+        !ghosting_is_valid_scene_state(pair.eye_state[1]) ||
+        pair.eye_state[0] == pair.eye_state[1])
+    {
+        return false;
+    }
+
+    GhostingFixOwnerCandidate candidate{};
+    GhostingOwnerResolveDiagnostic object_array_diagnostic{};
+    GhostingOwnerResolveDiagnostic object_hook_diagnostic{};
+    bool resolved = ghosting_resolve_current_owner(
+        pair.eye_state[0],
+        pair.eye_state[1],
+        candidate,
+        GhostingUObjectValidationMode::ObjectArray,
+        object_array_diagnostic);
+
+    if (!resolved && ghosting_can_use_uobject_hook()) {
+        resolved = ghosting_resolve_current_owner(
+            pair.eye_state[0],
+            pair.eye_state[1],
+            candidate,
+            GhostingUObjectValidationMode::UObjectHook,
+            object_hook_diagnostic);
+    }
+
+    constexpr uintptr_t FIRST_REFERENCE_OFFSET = 0x90;
+    constexpr uintptr_t SECOND_REFERENCE_OFFSET = 0xB8;
+    constexpr uint32_t REFERENCE_STRIDE =
+        static_cast<uint32_t>(SECOND_REFERENCE_OFFSET - FIRST_REFERENCE_OFFSET);
+
+    if (!resolved ||
+        candidate.local_player == nullptr ||
+        candidate.view_states_are_array ||
+        candidate.view_states_header != 0 ||
+        candidate.view_states_count != 2 ||
+        candidate.view_states_capacity != 2 ||
+        candidate.view_state_stride != REFERENCE_STRIDE ||
+        candidate.view_states_data !=
+            reinterpret_cast<uintptr_t>(candidate.local_player) + FIRST_REFERENCE_OFFSET)
+    {
+        return false;
+    }
+
+    uintptr_t primary_state_address{};
+    uintptr_t secondary_state_address{};
+    if (!safe_read_value(candidate.view_states_data + sizeof(uintptr_t), primary_state_address) ||
+        !safe_read_value(
+            candidate.view_states_data + REFERENCE_STRIDE + sizeof(uintptr_t),
+            secondary_state_address))
+    {
+        return false;
+    }
+
+    auto* const primary_state =
+        reinterpret_cast<sdk::FSceneViewStateInterface*>(primary_state_address);
+    auto* const secondary_state =
+        reinterpret_cast<sdk::FSceneViewStateInterface*>(secondary_state_address);
+    const bool natural_order =
+        primary_state == pair.eye_state[0] && secondary_state == pair.eye_state[1];
+    const bool swapped_order =
+        primary_state == pair.eye_state[1] && secondary_state == pair.eye_state[0];
+
+    if ((!natural_order && !swapped_order) ||
+        !ghosting_is_valid_scene_state(primary_state) ||
+        !ghosting_is_valid_scene_state(secondary_state) ||
+        primary_state == secondary_state)
+    {
+        return false;
+    }
+
+    pair.eye_state[0] = primary_state;
+    pair.eye_state[1] = secondary_state;
+    pair.orientation_confirmed = true;
+    pair.owner = {};
+    pair.pending_left_source_state = nullptr;
+    pair.pending_left_source_observations = 0;
+    pair.pending_left_source_frame = 0;
+    pair.pending_left_source_frame_valid = false;
+    pair.logged_owner_unavailable = false;
+    pair.logged_owner_stabilizing = false;
+    pair.logged_owner_validation_failed = false;
+    pair.logged_naturally_separated = false;
+
+    SPDLOG_INFO(
+        "[GhostingFix][DaysGone] Confirmed AFR eye ownership from exact LocalPlayer "
+        "ViewState/StereoViewState slots owner={:x} generation={} primary={:x} secondary={:x} swapped={}",
+        reinterpret_cast<uintptr_t>(candidate.local_player),
+        pair.generation,
+        primary_state_address,
+        secondary_state_address,
+        swapped_order);
+    return true;
+}
+
 bool FFakeStereoRenderingHook::validate_ghosting_fix_owner(
     const GhostingFixPair& pair,
     const char** failure_stage)
@@ -14162,6 +15810,93 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     sdk::FSceneViewInitOptionsBase::update_offsets(init_options);
 
+    // Days Gone reports a non-engine file version, so the generic UESDK
+    // version fallback selects the UE4.20+ tail for this customized UE4.11
+    // FSceneViewInitOptions. Validate the source-backed legacy tail against
+    // the already-resolved Family/SceneState pair before using it, and keep
+    // the override local to Native Fix so the confirmed Synced/Ghost path is
+    // unchanged.
+    constexpr size_t DAYS_GONE_VIEW_FAMILY_OFFSET = 0xB0;
+    constexpr size_t DAYS_GONE_SCENE_STATE_OFFSET = 0xB8;
+    constexpr size_t DAYS_GONE_STEREO_PASS_OFFSET = 0x100;
+    constexpr size_t DAYS_GONE_WORLD_TO_METERS_OFFSET = 0x104;
+    const bool daysgone_native_legacy_view_layout = [&]() {
+        if (!vr->is_native_stereo_fix_enabled() ||
+            !daysgone_is_current_game() ||
+            g_framework == nullptr ||
+            !g_framework->is_dx11())
+        {
+            return false;
+        }
+
+        const auto options_address = reinterpret_cast<uintptr_t>(init_options);
+        if (!is_readable_process_range(
+                options_address,
+                DAYS_GONE_WORLD_TO_METERS_OFFSET + sizeof(float)) ||
+            !is_writable_process_range(
+                options_address + DAYS_GONE_STEREO_PASS_OFFSET,
+                sizeof(uint32_t)))
+        {
+            return false;
+        }
+
+        const auto raw_family = *reinterpret_cast<sdk::FSceneViewFamily* const*>(
+            options_address + DAYS_GONE_VIEW_FAMILY_OFFSET);
+        const auto raw_scene_state = *reinterpret_cast<sdk::FSceneViewStateInterface* const*>(
+            options_address + DAYS_GONE_SCENE_STATE_OFFSET);
+        const auto raw_stereo_pass = *reinterpret_cast<const uint32_t*>(
+            options_address + DAYS_GONE_STEREO_PASS_OFFSET);
+        const auto raw_world_to_meters = *reinterpret_cast<const float*>(
+            options_address + DAYS_GONE_WORLD_TO_METERS_OFFSET);
+
+        const bool pointer_pair_matches =
+            raw_family != nullptr &&
+            raw_scene_state != nullptr &&
+            raw_family == init_options->get_view_family() &&
+            raw_scene_state == init_options->get_scene_state() &&
+            is_readable_process_range(reinterpret_cast<uintptr_t>(raw_family), sizeof(void*)) &&
+            is_readable_process_range(reinterpret_cast<uintptr_t>(raw_scene_state), sizeof(void*));
+        const bool pass_is_sane = raw_stereo_pass <= EStereoscopicPass::eSSP_SECONDARY;
+        const bool world_scale_is_sane =
+            std::isfinite(raw_world_to_meters) &&
+            raw_world_to_meters > 0.0f &&
+            raw_world_to_meters <= 100000.0f;
+
+        return pointer_pair_matches && pass_is_sane && world_scale_is_sane;
+    }();
+
+    if (daysgone_native_legacy_view_layout) {
+        SPDLOG_INFO_ONCE(
+            "[DaysGone][NativeFix] Using validated UE4.11 FSceneViewInitOptions eye metadata "
+            "Family=+0xB0 SceneState=+0xB8 StereoPass=+0x100 WorldToMeters=+0x104");
+    }
+
+    const auto get_effective_stereo_pass = [&]() -> uint32_t {
+        if (daysgone_native_legacy_view_layout) {
+            return *reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<uintptr_t>(init_options) + DAYS_GONE_STEREO_PASS_OFFSET);
+        }
+
+        return init_options->get_stereo_pass();
+    };
+    const auto set_effective_stereo_pass = [&](uint32_t pass) {
+        if (daysgone_native_legacy_view_layout) {
+            *reinterpret_cast<uint32_t*>(
+                reinterpret_cast<uintptr_t>(init_options) + DAYS_GONE_STEREO_PASS_OFFSET) = pass;
+            return;
+        }
+
+        init_options->set_stereo_pass(pass);
+    };
+    const auto get_effective_world_to_meters = [&]() -> std::optional<float> {
+        if (daysgone_native_legacy_view_layout) {
+            return *reinterpret_cast<const float*>(
+                reinterpret_cast<uintptr_t>(init_options) + DAYS_GONE_WORLD_TO_METERS_OFFSET);
+        }
+
+        return init_options->get_world_to_meters_scale();
+    };
+
     if (!is_ue_5_7_or_newer()) {
         if (auto view_family = init_options->get_view_family(); view_family != nullptr) {
             if (sdk::FSceneViewFamily::update_offsets(view_family, nullptr)) {
@@ -14177,8 +15912,11 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     const auto init_options_scene_state = init_options->get_scene_state();
     auto* native_effective_scene_state = init_options_scene_state;
-    const auto init_options_original_stereo_pass = init_options->get_stereo_pass();
-    const auto init_options_player_index = init_options->get_player_index();
+    const auto init_options_original_stereo_pass = get_effective_stereo_pass();
+    const auto init_options_player_index =
+        daysgone_native_legacy_view_layout
+            ? std::optional<int32_t>{}
+            : init_options->get_player_index();
     const auto init_options_view_family = init_options->get_view_family();
     const auto init_options_scene = init_options_view_family != nullptr
         ? init_options_view_family->get_scene_interface()
@@ -14199,7 +15937,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         }
 
         init_options->set_scene_state(init_options_scene_state);
-        init_options->set_stereo_pass(init_options_original_stereo_pass);
+        set_effective_stereo_pass(init_options_original_stereo_pass);
         if (init_options_player_index.has_value()) {
             init_options->set_player_index(*init_options_player_index);
         }
@@ -14232,7 +15970,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     ? EStereoscopicPass::eSSP_PRIMARY
                     : EStereoscopicPass::eSSP_SECONDARY;
             init_options->set_player_index(split_screen_metadata_player_index);
-            init_options->set_stereo_pass(split_screen_metadata_stereo_pass);
+            set_effective_stereo_pass(split_screen_metadata_stereo_pass);
             split_fiction_haze_metadata_active = true;
             restore_init_options_after_constructor = true;
         }
@@ -14333,7 +16071,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             // 100uu/m basis so UE5.6+ world-scale changes do not flatten the stereo view.
             SPDLOG_INFO_ONCE("[SceneViewCompat] Using fixed 100.0 world-to-meters for manual view offset");
         } else {
-            scene_world_to_meters = init_options->get_world_to_meters_scale().value_or(100.0f);
+            scene_world_to_meters = get_effective_world_to_meters().value_or(100.0f);
             if (!std::isfinite(scene_world_to_meters) || scene_world_to_meters <= 0.0f || scene_world_to_meters > 100000.0f) {
                 scene_world_to_meters = 100.0f;
             }
@@ -14452,7 +16190,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 (vr->is_native_stereo_fix_same_pass_enabled() && !preserve_secondary_pass);
 
             if (use_primary_constructor_pass) {
-                init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+                set_effective_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
                 restore_init_options_after_constructor = true;
                 if (force_primary_constructor_pass) {
                     SPDLOG_INFO_ONCE(
@@ -14580,6 +16318,10 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
         const auto scene_id = (uintptr_t)init_options_scene;
         const auto eye_index = true_index & 1;
         const auto other_eye_index = eye_index ^ 1;
+        const bool daysgone_exact_owner_orientation =
+            daysgone_is_current_game() &&
+            g_framework != nullptr &&
+            g_framework->is_dx11();
         const bool bootstrap_enabled = vr->is_ghosting_fix_bootstrap_enabled();
 
         const bool bootstrap_option_changed =
@@ -14838,16 +16580,20 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                 ghosting_pair.eye_state[0] != ghosting_pair.eye_state[1];
 
             if (has_valid_pair) {
+                if (daysgone_exact_owner_orientation && !ghosting_pair.orientation_confirmed) {
+                    orient_daysgone_ghosting_fix_pair_from_owner(ghosting_pair);
+                }
+
                 // Bootstrap can construct both candidate states in one engine
                 // frame, before AFR eye ownership is stable. Treat the pair as
                 // unordered until the same raw state is observed repeatedly
                 // on later left-eye frames.
-                if (eye_index == 0) {
-                    if (ghosting_pair.pending_left_source_state == init_options_scene_state) {
-                        const bool is_new_engine_frame =
-                            !ghosting_pair.pending_left_source_frame_valid ||
-                            ghosting_pair.pending_left_source_frame != g_frame_count;
+                if (!daysgone_exact_owner_orientation && eye_index == 0) {
+                    const bool is_new_engine_frame =
+                        !ghosting_pair.pending_left_source_frame_valid ||
+                        ghosting_pair.pending_left_source_frame != g_frame_count;
 
+                    if (ghosting_pair.pending_left_source_state == init_options_scene_state) {
                         if (is_new_engine_frame &&
                             ghosting_pair.pending_left_source_observations < std::numeric_limits<uint8_t>::max())
                         {
@@ -14860,7 +16606,8 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     ghosting_pair.pending_left_source_frame = g_frame_count;
                     ghosting_pair.pending_left_source_frame_valid = true;
 
-                    if (ghosting_pair.pending_left_source_observations >= ORIENTATION_CONFIRMATION_LEFT_OBSERVATIONS) {
+                    if (ghosting_pair.pending_left_source_observations >= ORIENTATION_CONFIRMATION_LEFT_OBSERVATIONS)
+                    {
                         const bool swapped = ghosting_pair.eye_state[0] != init_options_scene_state;
 
                         if (swapped) {
@@ -14934,7 +16681,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                     } else {
                         ghosting_pair.logged_owner_unavailable = false;
 
-                        init_options->set_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
+                        set_effective_stereo_pass(EStereoscopicPass::eSSP_PRIMARY);
 
                         if (replaced_scene_state) {
                             init_options->set_scene_state(ghosting_pair.eye_state[1]);
@@ -14961,7 +16708,12 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                                     ghosting_pair.owner.view_state_stride);
                             }
                         } else {
-                            ghosting_state = GhostingFixState::NaturallySeparated;
+                            const bool daysgone_has_applied_remap =
+                                daysgone_exact_owner_orientation &&
+                                g_hook->m_sceneview_data.ghosting_last_right_eye_remap_observation != 0;
+                            ghosting_state = daysgone_has_applied_remap
+                                ? GhostingFixState::Active
+                                : GhostingFixState::NaturallySeparated;
 
                             if (!ghosting_pair.logged_naturally_separated) {
                                 ghosting_pair.logged_naturally_separated = true;
@@ -14976,6 +16728,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
                         }
                     }
                 } else if (
+                    !(daysgone_exact_owner_orientation && owner_is_current) &&
                     ghosting_state != GhostingFixState::NaturallySeparated &&
                     (g_hook->m_sceneview_data.ghosting_last_right_eye_remap_time.time_since_epoch().count() == 0 ||
                      now - g_hook->m_sceneview_data.ghosting_last_right_eye_remap_time > std::chrono::milliseconds{500}))
@@ -15915,9 +17668,22 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
                 uintptr_t actual_vtable{};
                 std::memcpy(&actual_vtable, family, sizeof(actual_vtable));
 
-                if (expected_vtable == 0 || actual_vtable != expected_vtable) {
+                const auto accepted_dune_renderer_family =
+                    actual_vtable != expected_vtable &&
+                    validate_dune_renderer_view_family(family, expected_vtable, actual_vtable);
+                if (expected_vtable == 0 ||
+                    (actual_vtable != expected_vtable && !accepted_dune_renderer_family))
+                {
                     reject_candidate("unexpected FSceneViewFamily vtable");
                     return;
+                }
+
+                if (accepted_dune_renderer_family) {
+                    SPDLOG_INFO_ONCE(
+                        "[Dune][NativeStereoFix] Accepted structurally validated polymorphic family "
+                        "vtable={:x} discovered_family_vtable={:x}",
+                        actual_vtable,
+                        expected_vtable);
                 }
             }
         }
@@ -16893,6 +18659,61 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         return;
     }
 
+    const auto use_daysgone_same_frame_render =
+        daysgone_is_current_game() && g_framework != nullptr && g_framework->is_dx11();
+    uint32_t daysgone_frame_before{};
+    DaysGoneOffscreenViewContract daysgone_offscreen_contract{};
+    if (use_daysgone_same_frame_render) {
+        uint32_t family_frame_before{};
+        if (SceneViewExtensionAnalyzer::frame_count_offset !=
+                DAYS_GONE_VIEW_FAMILY_FRAME_NUMBER_OFFSET ||
+            !read_daysgone_frame_state(
+                view_family,
+                daysgone_frame_before,
+                family_frame_before))
+        {
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                "Days Gone frame-number layout did not validate");
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Preserving the original two-view render because the "
+                "UE4.11 frame-number layout was unavailable");
+            call_original();
+            return;
+        }
+
+        const char* contract_failure_reason{};
+        if (!validate_daysgone_offscreen_view_contract(
+                native_right_view,
+                view_family,
+                daysgone_offscreen_contract,
+                contract_failure_reason))
+        {
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                contract_failure_reason != nullptr
+                    ? contract_failure_reason
+                    : "Days Gone offscreen-view contract did not validate");
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Preserving the original two-view render because the "
+                "UE4.11 offscreen-view contract was unavailable: {}",
+                contract_failure_reason != nullptr
+                    ? contract_failure_reason
+                    : "unknown validation failure");
+            call_original();
+            return;
+        }
+
+        SPDLOG_INFO_ONCE(
+            "[DaysGone][NativeFix] Validated Bend offscreen-view contract: "
+            "bIsSceneCapture={} bUseSeparateRenderTarget={} bResolveScene={}",
+            daysgone_offscreen_contract.original_values[0],
+            daysgone_offscreen_contract.original_values[1],
+            daysgone_offscreen_contract.original_values[2]);
+    }
+
     const auto runtime_frame_count = runtime->internal_frame_count;
 
     // The second render must consume the same runtime pose assignment as the
@@ -16928,24 +18749,142 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     views.count = 1;
     call_original();
 
+    uint32_t daysgone_first_frame{};
+    if (use_daysgone_same_frame_render) {
+        uint32_t global_frame{};
+        uint32_t family_frame{};
+        daysgone_first_frame = daysgone_frame_before + 1u;
+        if (!read_daysgone_frame_state(view_family, global_frame, family_frame) ||
+            global_frame != daysgone_first_frame || family_frame != daysgone_first_frame)
+        {
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                "Days Gone first renderer did not advance one exact engine frame");
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Right-eye render rejected after the first renderer "
+                "changed frame identity unexpectedly global={} family={} expected={}",
+                global_frame,
+                family_frame,
+                daysgone_first_frame);
+            return;
+        }
+    }
+
     // Render only the proven secondary view into the generation-owned target.
     view_family->set_render_target(rtfrt);
     views.data[0] = native_right_view;
     views.count = 1;
 
+    if (use_daysgone_same_frame_render) {
+        const char* failure_reason{};
+        if (!begin_daysgone_native_frame_override(
+                view_family,
+                daysgone_first_frame,
+                failure_reason))
+        {
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                failure_reason != nullptr
+                    ? failure_reason
+                    : "Days Gone same-frame transaction could not begin");
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Right-eye render rejected before submission: {}",
+                failure_reason != nullptr ? failure_reason : "unknown validation failure");
+            return;
+        }
+    }
+
     if (auto* scene = reinterpret_cast<sdk::FScene*>(view_family_scene); scene != nullptr) {
         scene->decrement_frame_count();
     }
 
-    if (uses_tarrayview) {
-        sdk::FSceneViewFamily* selected_family = view_family;
-        TArrayViewViewFamily second_family_array{&selected_family, 1};
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(
-            render_module,
-            canvas,
-            reinterpret_cast<sdk::FSceneViewFamily*>(&second_family_array));
+    utility::ScopeGuard clear_daysgone_frame_override{[&]() {
+        if (use_daysgone_same_frame_render) {
+            clear_daysgone_native_frame_override();
+        }
+    }};
+
+    const auto render_secondary_view = [&]() {
+        if (uses_tarrayview) {
+            sdk::FSceneViewFamily* selected_family = view_family;
+            TArrayViewViewFamily second_family_array{&selected_family, 1};
+            g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(
+                render_module,
+                canvas,
+                reinterpret_cast<sdk::FSceneViewFamily*>(&second_family_array));
+        } else {
+            g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(
+                render_module,
+                canvas,
+                view_family);
+        }
+    };
+
+    bool daysgone_offscreen_contract_restored{true};
+    if (use_daysgone_same_frame_render) {
+        if (!apply_daysgone_offscreen_view_contract(daysgone_offscreen_contract)) {
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                "Days Gone right render could not enter the Bend offscreen contract");
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Right-eye render rejected because "
+                "the Bend offscreen view/family flags could not be committed");
+            return;
+        }
+
+        {
+            utility::ScopeGuard restore_offscreen_contract{[&]() {
+                daysgone_offscreen_contract_restored =
+                    restore_daysgone_offscreen_view_contract(daysgone_offscreen_contract);
+            }};
+            SPDLOG_INFO_ONCE(
+                "[DaysGone][NativeFix] Rendering SECONDARY with Bend's validated final-color offscreen contract");
+            render_secondary_view();
+        }
+
+        if (!daysgone_offscreen_contract_restored) {
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                "Days Gone right render offscreen flags were not restored");
+            SPDLOG_ERROR_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Right-eye render completed, but "
+                "the Bend offscreen view/family flags could not be restored");
+            return;
+        }
     } else {
-        g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(render_module, canvas, view_family);
+        render_secondary_view();
+    }
+
+    if (use_daysgone_same_frame_render) {
+        const auto override_applied = g_daysgone_native_frame_override.applied;
+        const auto failure_reason = g_daysgone_native_frame_override.failure_reason;
+        uint32_t global_frame{};
+        uint32_t family_frame{};
+        const auto final_frame_valid =
+            read_daysgone_frame_state(view_family, global_frame, family_frame) &&
+            global_frame == daysgone_first_frame && family_frame == daysgone_first_frame;
+        if (!override_applied || !final_frame_valid) {
+            restore_daysgone_incremented_frame_if_exact(view_family, daysgone_first_frame);
+            g_hook->invalidate_native_stereo_frame_packet(
+                NativeStereoFixState::FailedClosed,
+                failure_reason != nullptr
+                    ? failure_reason
+                    : "Days Gone same-frame transaction did not survive renderer construction");
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[DaysGone][NativeFix] Right-eye renderer failed the same-frame transaction "
+                "applied={} global={} family={} expected={} reason={}",
+                override_applied,
+                global_frame,
+                family_frame,
+                daysgone_first_frame,
+                failure_reason != nullptr ? failure_reason : "post-render validation");
+            return;
+        }
     }
 
     publish_native_packet();
@@ -16964,6 +18903,10 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
         g_begin_render_viewfamily_timing.add(std::chrono::steady_clock::now() - begin_render_viewfamily_start);
         log_engine_render_timing_if_needed();
     }};
+
+    if (daysgone_is_current_game()) {
+        apply_daysgone_native_frame_override(view_family);
+    }
 
     SPDLOG_INFO_ONCE("Called BeginRenderViewFamily for the first time");
 
@@ -17077,6 +19020,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
                 reinterpret_cast<uintptr_t>(begin_rendering_view_family_real_fn));
             g_hook->m_render_module_begin_render_viewfamily_hook = {};
             g_hook->m_render_module_begin_render_viewfamily_observed.store(false, std::memory_order_release);
+            g_daysgone_gframe_number.store(0, std::memory_order_release);
             begin_rendering_view_family_real_fn = nullptr;
             callbacks_since_install = 0;
             calls_until_retry = 0;
@@ -17090,10 +19034,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
             ++resolver_attempts;
             calls_until_retry = 30;
 
-            const auto candidate = dune_awakening_is_current_game()
+            // Keep the signature-validated Dune renderer resolver available
+            // even while its retired D3D12/custom-present experiments remain
+            // disabled. The generic stack fallback can otherwise select an
+            // unrelated large renderer frame with a different ABI.
+            const auto candidate = dune_native_fix_renderer_resolver_is_current_game()
                 ? resolve_dune_begin_rendering_viewfamilies()
-                : resolve_begin_rendering_viewfamilies_from_stack(
-                    reinterpret_cast<uintptr_t>(_ReturnAddress()));
+                : pokemon_emerald_is_current_game()
+                    ? resolve_pokemon_emerald_begin_rendering_viewfamilies()
+                    : resolve_begin_rendering_viewfamilies_from_stack(
+                        reinterpret_cast<uintptr_t>(_ReturnAddress()));
             if (!candidate) {
                 SPDLOG_WARN(
                     "[ViewFamilySelector] Failed to resolve BeginRenderingViewFamilies on attempt {}; "
@@ -17112,6 +19062,9 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
                 reinterpret_cast<uintptr_t>(begin_rendering_view_family_real_fn),
                 resolver_attempts);
 
+            configure_daysgone_gframe_number(
+                reinterpret_cast<uintptr_t>(begin_rendering_view_family_real_fn));
+
             g_hook->m_render_module_begin_render_viewfamily_hook = safetyhook::create_inline(
                 reinterpret_cast<uintptr_t>(begin_rendering_view_family_real_fn),
                 reinterpret_cast<uintptr_t>(&begin_render_viewfamily_real));
@@ -17120,6 +19073,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
                 SPDLOG_INFO("[ViewFamilySelector] Hooked BeginRenderingViewFamilies real function");
             } else {
                 SPDLOG_ERROR("[ViewFamilySelector] Failed to hook BeginRenderingViewFamilies real function");
+                g_daysgone_gframe_number.store(0, std::memory_order_release);
                 begin_rendering_view_family_real_fn = nullptr;
             }
         }
@@ -17169,9 +19123,10 @@ const char* FFakeStereoRenderingHook::get_ghosting_fix_status_text() {
     case GhostingFixState::NaturallySeparated:
         return "paired; engine histories already separate";
     case GhostingFixState::Active:
-        if (m_sceneview_data.ghosting_last_right_eye_remap_time.time_since_epoch().count() == 0 ||
+        if (!daysgone_is_current_game() &&
+            (m_sceneview_data.ghosting_last_right_eye_remap_time.time_since_epoch().count() == 0 ||
             std::chrono::steady_clock::now() - m_sceneview_data.ghosting_last_right_eye_remap_time >
-                std::chrono::milliseconds{500})
+                std::chrono::milliseconds{500}))
         {
             return "paired; right-eye remap stale";
         }
@@ -17379,7 +19334,142 @@ bool FFakeStereoRenderingHook::is_native_stereo_fix_operational() const {
     return m_native_stereo_fix_state.load(std::memory_order_acquire) == NativeStereoFixState::Active;
 }
 
+void FFakeStereoRenderingHook::pre_render_view_renderthread(
+    ISceneViewExtension* extension,
+    sdk::FRHICommandListBase* cmd_list,
+    sdk::FSceneView& view)
+{
+    if (!dune_native_fix_renderer_resolver_is_current_game()) {
+        return;
+    }
+
+    // The Dune public-test build can invoke slot 7 before the view's Family
+    // backlink is readable. Render-thread jobs must still make progress.
+    bool delegated_worker_pump = false;
+    utility::ScopeGuard render_thread_worker_guard{[&]() {
+        if (!delegated_worker_pump) {
+            RenderThreadWorker::get().execute();
+        }
+    }};
+
+    auto* const family = view.get_view_family();
+    if (family == nullptr ||
+        !is_readable_process_range(
+            reinterpret_cast<uintptr_t>(family),
+            SceneViewExtensionAnalyzer::DUNE_UE52_FRAME_NUMBER_OFFSET + sizeof(uint32_t)))
+    {
+        SPDLOG_WARN_ONCE("[Dune][ViewExtension] Rejected PreRenderView callback without a readable owning family");
+        return;
+    }
+
+    uintptr_t family_vtable{};
+    uintptr_t first_virtual{};
+    uintptr_t render_target{};
+    uintptr_t scene{};
+    uint32_t frame{};
+    sdk::TArray<sdk::FSceneView*> views{};
+    const auto family_address = reinterpret_cast<uintptr_t>(family);
+    std::memcpy(&family_vtable, reinterpret_cast<const void*>(family_address), sizeof(family_vtable));
+    std::memcpy(
+        &views,
+        reinterpret_cast<const void*>(family_address + SceneViewExtensionAnalyzer::DUNE_UE52_VIEWS_OFFSET),
+        sizeof(views));
+    std::memcpy(
+        &render_target,
+        reinterpret_cast<const void*>(family_address + SceneViewExtensionAnalyzer::DUNE_UE52_RENDER_TARGET_OFFSET),
+        sizeof(render_target));
+    std::memcpy(
+        &scene,
+        reinterpret_cast<const void*>(family_address + SceneViewExtensionAnalyzer::DUNE_UE52_SCENE_OFFSET),
+        sizeof(scene));
+    std::memcpy(
+        &frame,
+        reinterpret_cast<const void*>(family_address + SceneViewExtensionAnalyzer::DUNE_UE52_FRAME_NUMBER_OFFSET),
+        sizeof(frame));
+
+    if (family_vtable == 0 ||
+        !is_readable_process_range(family_vtable, sizeof(first_virtual)))
+    {
+        SPDLOG_WARN_ONCE("[Dune][ViewExtension] Rejected PreRenderView callback with an unreadable family vtable");
+        return;
+    }
+
+    std::memcpy(&first_virtual, reinterpret_cast<const void*>(family_vtable), sizeof(first_virtual));
+
+    if (!is_executable_process_range(first_virtual, 1) ||
+        views.data == nullptr ||
+        views.count <= 0 || views.count > 16 ||
+        views.capacity < views.count || views.capacity > 1024 ||
+        !is_readable_process_range(
+            reinterpret_cast<uintptr_t>(views.data),
+            sizeof(sdk::FSceneView*) * static_cast<size_t>(views.count)) ||
+        render_target == 0 ||
+        !is_readable_process_range(render_target, sizeof(uintptr_t)) ||
+        scene == 0 ||
+        !is_readable_process_range(scene, sizeof(uintptr_t)) ||
+        frame < 10 || frame == std::numeric_limits<uint32_t>::max())
+    {
+        SPDLOG_WARN_ONCE("[Dune][ViewExtension] Rejected PreRenderView callback with an invalid UE5.2 family layout");
+        return;
+    }
+
+    bool owns_view = false;
+    for (int32_t i = 0; i < views.count; ++i) {
+        if (views.data[i] == &view) {
+            owns_view = true;
+            break;
+        }
+    }
+
+    if (!owns_view || !view.has_view_family(family)) {
+        SPDLOG_WARN_ONCE("[Dune][ViewExtension] Rejected PreRenderView callback whose view is not owned by the candidate family");
+        return;
+    }
+
+    delegated_worker_pump = true;
+    pre_render_viewfamily_renderthread(extension, cmd_list, *family);
+}
+
 void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExtension* extension, sdk::FRHICommandListBase* cmd_list, sdk::FSceneViewFamily& view_family) {
+    // Install this before Dune validation and de-duplication so a delegated
+    // slot-7 callback always services the queue exactly once.
+    utility::ScopeGuard render_thread_worker_guard{[]() {
+        RenderThreadWorker::get().execute();
+    }};
+
+    if (dune_native_fix_renderer_resolver_is_current_game() &&
+        SceneViewExtensionAnalyzer::frame_count_offset == SceneViewExtensionAnalyzer::DUNE_UE52_FRAME_NUMBER_OFFSET)
+    {
+        const auto family_address = reinterpret_cast<uintptr_t>(&view_family);
+        if (!is_readable_process_range(
+                family_address + SceneViewExtensionAnalyzer::DUNE_UE52_FRAME_NUMBER_OFFSET,
+                sizeof(uint32_t)))
+        {
+            SPDLOG_WARN_ONCE("[Dune][ViewExtension] Rejected unreadable render-thread family callback");
+            return;
+        }
+
+        uint32_t frame{};
+        std::memcpy(
+            &frame,
+            reinterpret_cast<const void*>(family_address + SceneViewExtensionAnalyzer::DUNE_UE52_FRAME_NUMBER_OFFSET),
+            sizeof(frame));
+
+        struct DunePreRenderKey {
+            uint32_t frame{};
+            uintptr_t family{};
+        };
+        static thread_local DunePreRenderKey last_dune_key{};
+        const DunePreRenderKey current_dune_key{frame, family_address};
+        if (current_dune_key.frame == last_dune_key.frame &&
+            current_dune_key.family == last_dune_key.family)
+        {
+            return;
+        }
+
+        last_dune_key = current_dune_key;
+    }
+
     ZoneScopedN("PreRenderViewFamily_RenderThread");
     const auto profile_engine_render = should_profile_engine_render_timing();
     const auto prerender_viewfamily_rt_start =
@@ -17391,10 +19481,6 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
 
         g_prerender_viewfamily_rt_timing.add(std::chrono::steady_clock::now() - prerender_viewfamily_rt_start);
         log_engine_render_timing_if_needed();
-    }};
-
-    utility::ScopeGuard _{[]() {
-        RenderThreadWorker::get().execute();
     }};
 
     SPDLOG_INFO_ONCE("Called PreRenderViewFamily_RenderThread for the first time");
@@ -19829,11 +21915,12 @@ __forceinline Matrix4x4f* FFakeStereoRenderingHook::calculate_stereo_projection_
     // the missing right-eye ViewState. Preserve the established Native Fix
     // bootstrap on every supported engine, with source-validated handling for
     // the UE4.25/4.26 layouts below.
-    const bool ue426_needs_localplayer_bootstrap = is_ue_4_26_runtime();
+    const bool ue425_426_needs_localplayer_bootstrap =
+        is_ue_4_25_runtime() || is_ue_4_26_runtime();
     const bool native_needs_localplayer_bootstrap = vr->is_native_stereo_fix_enabled();
     const bool wants_localplayer_bootstrap =
         wants_ghosting_bootstrap ||
-        ue426_needs_localplayer_bootstrap ||
+        ue425_426_needs_localplayer_bootstrap ||
         native_needs_localplayer_bootstrap ||
         vr->is_splitscreen_compatibility_enabled() ||
         vr->is_sceneview_compatibility_enabled() ||
@@ -23658,6 +25745,36 @@ void FFakeStereoRenderingHook::daysgone_slate_intermediate_buffer_hook(safetyhoo
         return;
     }
 
+    // Keep a short render-thread history. Bend can rotate among multiple
+    // Slate intermediates, so identity matching must not depend on whichever
+    // one happened to be the most recent when the consumer hook runs.
+    const auto recent_index =
+        g_hook->m_daysgone_recent_slate_target_write_index.fetch_add(1, std::memory_order_relaxed) %
+        DAYSGONE_RECENT_SLATE_TARGET_COUNT;
+    g_hook->m_daysgone_recent_slate_pooled_targets[recent_index].store(
+        reinterpret_cast<uintptr_t>(slate_texture),
+        std::memory_order_relaxed);
+    g_hook->m_daysgone_recent_slate_target_frames[recent_index].store(
+        g_frame_count,
+        std::memory_order_relaxed);
+    g_hook->m_daysgone_recent_slate_native_targets[recent_index].store(
+        reinterpret_cast<uintptr_t>(candidate.native),
+        std::memory_order_release);
+
+    // Once the exact Bend consumer has identified the texture actually bound
+    // as SlateCompositeTexture, keep that authoritative source. The producer
+    // can rotate through additional 1920x1080 and HMD-sized intermediates in
+    // the same frame; publishing each of those caused UI source churn.
+    const auto consumer_frame =
+        g_hook->m_daysgone_slate_consumer_target_frame.load(std::memory_order_acquire);
+    const auto consumer_age = static_cast<uint32_t>(g_frame_count - consumer_frame);
+    if (g_hook->m_daysgone_ahud_overlay_ready.load(std::memory_order_acquire) &&
+        consumer_frame != 0 &&
+        consumer_age <= 4)
+    {
+        return;
+    }
+
     const auto last_target = g_hook->m_daysgone_slate_intermediate_last_target.load();
     const auto last_native = g_hook->m_daysgone_slate_native_ui_target.load();
     if (last_target == (uintptr_t)slate_texture && last_native == (uintptr_t)candidate.native) {
@@ -23719,17 +25836,90 @@ void FFakeStereoRenderingHook::attempt_hook_daysgone_bend_taa_composite() {
         SPDLOG_WARN(
             "[DaysGone][BendTAA] Refusing composite hook at {:x}: byte signature mismatch",
             hook_address);
+    } else {
+        auto hook_result = safetyhook::create_mid(
+            (void*)hook_address,
+            &FFakeStereoRenderingHook::daysgone_bend_taa_composite_hook);
+        if (!hook_result) {
+            SPDLOG_WARN("[DaysGone][BendTAA] Failed to hook BendTemporalAA composite at {:x}", hook_address);
+        } else {
+            m_daysgone_bend_taa_composite_hook = std::move(hook_result);
+            SPDLOG_INFO("[DaysGone][BendTAA] Hooked BendTemporalAA Slate composite at {:x}", hook_address);
+        }
+    }
+
+    // Hook the exact shader-resource loads for the two Bend temporal variants.
+    // Replacing only SlateCompositeTexture preserves temporal AA, the scene
+    // texture, and every non-Slate pass.
+    constexpr uintptr_t kSlateTextureLoadSignatureRva = 0x201CF09;
+    constexpr uintptr_t kSlateTextureLoadedHookRva = 0x201CF11;
+    constexpr std::array<uint8_t, 16> kSlateTextureLoadExpectedBytes{
+        0x48, 0x8B, 0x45, 0x20,
+        0x4C, 0x8B, 0x70, 0x10,
+        0x66, 0x44, 0x39, 0xAF, 0xD6, 0x00, 0x00, 0x00,
+    };
+
+    const auto slate_load_signature = module + kSlateTextureLoadSignatureRva;
+    const auto slate_loaded_hook = module + kSlateTextureLoadedHookRva;
+    if (!is_executable_process_range(slate_load_signature, kSlateTextureLoadExpectedBytes.size()) ||
+        std::memcmp(
+            (void*)slate_load_signature,
+            kSlateTextureLoadExpectedBytes.data(),
+            kSlateTextureLoadExpectedBytes.size()) != 0)
+    {
+        SPDLOG_WARN(
+            "[DaysGone][BendTAA] Refusing Slate texture-binding hook at {:x}: byte signature mismatch",
+            slate_loaded_hook);
         return;
     }
 
-    auto hook_result = safetyhook::create_mid((void*)hook_address, &FFakeStereoRenderingHook::daysgone_bend_taa_composite_hook);
-    if (!hook_result) {
-        SPDLOG_WARN("[DaysGone][BendTAA] Failed to hook BendTemporalAA composite at {:x}", hook_address);
+    auto slate_hook_result = safetyhook::create_mid(
+        (void*)slate_loaded_hook,
+        &FFakeStereoRenderingHook::daysgone_bend_taa_slate_texture_hook);
+    if (!slate_hook_result) {
+        SPDLOG_WARN("[DaysGone][BendTAA] Failed to hook Slate texture binding at {:x}", slate_loaded_hook);
         return;
     }
 
-    m_daysgone_bend_taa_composite_hook = std::move(hook_result);
-    SPDLOG_INFO("[DaysGone][BendTAA] Hooked BendTemporalAA Slate composite at {:x}", hook_address);
+    m_daysgone_bend_taa_slate_texture_hook = std::move(slate_hook_result);
+    SPDLOG_INFO("[DaysGone][BendTAA] Hooked exact CopyTemporalAA Slate texture binding at {:x}", slate_loaded_hook);
+
+    constexpr uintptr_t kTemporalSlateTextureLoadSignatureRva = 0x201D9BD;
+    constexpr uintptr_t kTemporalSlateTextureLoadedHookRva = 0x201D9C5;
+    constexpr std::array<uint8_t, 17> kTemporalSlateTextureLoadExpectedBytes{
+        0x48, 0x8B, 0x43, 0x20,
+        0x48, 0x8B, 0x70, 0x10,
+        0x66, 0x41, 0x83, 0xBD, 0xE6, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    const auto temporal_slate_load_signature = module + kTemporalSlateTextureLoadSignatureRva;
+    const auto temporal_slate_loaded_hook = module + kTemporalSlateTextureLoadedHookRva;
+    if (!is_executable_process_range(
+            temporal_slate_load_signature,
+            kTemporalSlateTextureLoadExpectedBytes.size()) ||
+        std::memcmp(
+            (void*)temporal_slate_load_signature,
+            kTemporalSlateTextureLoadExpectedBytes.data(),
+            kTemporalSlateTextureLoadExpectedBytes.size()) != 0)
+    {
+        SPDLOG_WARN(
+            "[DaysGone][BendTAA] Refusing temporal Slate texture-binding hook at {:x}: byte signature mismatch",
+            temporal_slate_loaded_hook);
+        return;
+    }
+
+    auto temporal_slate_hook_result = safetyhook::create_mid(
+        (void*)temporal_slate_loaded_hook,
+        &FFakeStereoRenderingHook::daysgone_bend_taa_temporal_slate_texture_hook);
+    if (!temporal_slate_hook_result) {
+        SPDLOG_WARN(
+            "[DaysGone][BendTAA] Failed to hook temporal Slate texture binding at {:x}",
+            temporal_slate_loaded_hook);
+        return;
+    }
+
+    m_daysgone_bend_taa_temporal_slate_texture_hook = std::move(temporal_slate_hook_result);
+    SPDLOG_INFO("[DaysGone][BendTAA] Hooked temporal Slate texture binding at {:x}", temporal_slate_loaded_hook);
 }
 
 void FFakeStereoRenderingHook::daysgone_bend_taa_composite_hook(safetyhook::Context& ctx) {
@@ -23773,6 +25963,198 @@ void FFakeStereoRenderingHook::daysgone_bend_taa_composite_hook(safetyhook::Cont
         had_crop,
         (unsigned long long)g_hook->m_daysgone_bend_taa_composite_seen.load(),
         (unsigned long long)g_hook->m_daysgone_bend_taa_composite_crop_suppressed.load());
+}
+
+void FFakeStereoRenderingHook::daysgone_bend_taa_slate_texture_hook(safetyhook::Context& ctx) {
+    if (g_hook == nullptr) {
+        return;
+    }
+
+    uintptr_t replacement{};
+    if (g_hook->try_redirect_daysgone_bend_slate_texture(
+            static_cast<uintptr_t>(ctx.rbp),
+            static_cast<uintptr_t>(ctx.r14),
+            "CopyTemporalAA",
+            replacement))
+    {
+        ctx.r14 = replacement;
+    }
+}
+
+void FFakeStereoRenderingHook::daysgone_bend_taa_temporal_slate_texture_hook(safetyhook::Context& ctx) {
+    if (g_hook == nullptr) {
+        return;
+    }
+
+    uintptr_t replacement{};
+    if (g_hook->try_redirect_daysgone_bend_slate_texture(
+            static_cast<uintptr_t>(ctx.rbx),
+            static_cast<uintptr_t>(ctx.rsi),
+            "BendTemporalAA",
+            replacement))
+    {
+        ctx.rsi = replacement;
+    }
+}
+
+void FFakeStereoRenderingHook::note_daysgone_ahud_overlay_submitted() {
+    // Use the same render-generation clock as the Bend hooks. This avoids a
+    // timer query in either render hot path and keeps suppression fail-open if
+    // the extracted layer stops receiving successful submissions.
+    m_daysgone_ahud_overlay_last_submit_frame.store(g_frame_count, std::memory_order_relaxed);
+    m_daysgone_ahud_overlay_ready.store(true, std::memory_order_release);
+}
+
+bool FFakeStereoRenderingHook::try_redirect_daysgone_bend_slate_texture(
+    uintptr_t pass,
+    uintptr_t loaded_rhi_texture,
+    const char* variant,
+    uintptr_t& replacement_rhi_texture)
+{
+    replacement_rhi_texture = 0;
+
+    if (g_hook == nullptr ||
+        !daysgone_is_current_game() ||
+        g_framework == nullptr ||
+        !g_framework->is_dx11())
+    {
+        return false;
+    }
+
+    auto vr = VR::get();
+    if (vr == nullptr ||
+        vr->get_runtime() == nullptr ||
+        !vr->get_runtime()->is_openxr() ||
+        !vr->is_hmd_active() ||
+        !vr->is_ahud_compatibility_enabled())
+    {
+        return false;
+    }
+
+    const auto consumer_seen =
+        m_daysgone_bend_taa_slate_consumer_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    uintptr_t slate_pooled_target{};
+    if (!daysgone_read_value(pass + 0x20, slate_pooled_target) || slate_pooled_target == 0) {
+        m_daysgone_bend_taa_slate_rejected.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    uintptr_t slate_rhi_texture{};
+    if (!daysgone_read_value(slate_pooled_target + 0x10, slate_rhi_texture) ||
+        slate_rhi_texture == 0 ||
+        slate_rhi_texture != loaded_rhi_texture)
+    {
+        m_daysgone_bend_taa_slate_rejected.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    DaysGoneD3D11TextureCandidate slate_candidate{};
+    if (!daysgone_try_get_d3d11_texture_candidate(
+            reinterpret_cast<FRHITexture2D*>(slate_pooled_target),
+            slate_candidate) ||
+        !daysgone_is_plausible_slate_ui_desc(slate_candidate.desc))
+    {
+        m_daysgone_bend_taa_slate_rejected.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    bool is_recent_captured_slate_target = false;
+    uintptr_t matched_capture_wrapper{};
+    uint32_t matched_capture_frame{};
+    for (size_t i = 0; i < DAYSGONE_RECENT_SLATE_TARGET_COUNT; ++i) {
+        const auto captured_native =
+            m_daysgone_recent_slate_native_targets[i].load(std::memory_order_acquire);
+        const auto captured_frame =
+            m_daysgone_recent_slate_target_frames[i].load(std::memory_order_relaxed);
+        const auto frame_age = static_cast<uint32_t>(g_frame_count - captured_frame);
+        if (captured_native == reinterpret_cast<uintptr_t>(slate_candidate.native) && frame_age <= 4) {
+            is_recent_captured_slate_target = true;
+            matched_capture_wrapper =
+                m_daysgone_recent_slate_pooled_targets[i].load(std::memory_order_relaxed);
+            matched_capture_frame = captured_frame;
+            break;
+        }
+    }
+
+    if (!is_recent_captured_slate_target) {
+        m_daysgone_bend_taa_slate_rejected.fetch_add(1, std::memory_order_relaxed);
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[DaysGone][AHUD] {} Slate consumer did not match a current captured target; preserving it seen={} rejected={}",
+            variant,
+            (unsigned long long)consumer_seen,
+            (unsigned long long)m_daysgone_bend_taa_slate_rejected.load());
+        return false;
+    }
+
+    // The consumer, not the producer, is the authoritative answer to which
+    // rotating intermediate contains the final Slate UI for this frame. This
+    // event-driven publication also picks up newly opened and resized windows
+    // without polling or walking the UObject widget tree.
+    m_daysgone_slate_intermediate_last_target.store(matched_capture_wrapper, std::memory_order_relaxed);
+    m_daysgone_slate_native_ui_width.store(slate_candidate.desc.Width, std::memory_order_relaxed);
+    m_daysgone_slate_native_ui_height.store(slate_candidate.desc.Height, std::memory_order_relaxed);
+    m_daysgone_slate_native_ui_target.store(
+        reinterpret_cast<uintptr_t>(slate_candidate.native),
+        std::memory_order_release);
+    m_daysgone_slate_consumer_target_frame.store(g_frame_count, std::memory_order_release);
+
+    const auto last_submit_frame = m_daysgone_ahud_overlay_last_submit_frame.load(std::memory_order_relaxed);
+    const auto submit_age = static_cast<uint32_t>(g_frame_count - last_submit_frame);
+    if (!m_daysgone_ahud_overlay_ready.load(std::memory_order_acquire) ||
+        last_submit_frame == 0 ||
+        submit_age > 8)
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[DaysGone][AHUD] Selected the consumed Slate target; preserving its scene composite until the fixed UI layer submits");
+        return false;
+    }
+
+    // Stock UE4.11 and this Bend fork place GSystemTextures.BlackDummy at
+    // GSystemTextures+0x38. It is a transparent float4(0,0,0,0), so replacing
+    // only this exact SRV removes the duplicate without skipping the pass.
+    constexpr uintptr_t kBlackDummyPooledTargetRva = 0x4A6E8E8;
+    const auto module = reinterpret_cast<uintptr_t>(utility::get_executable());
+    uintptr_t black_pooled_target{};
+    uintptr_t black_rhi_texture{};
+    uintptr_t black_rhi_vtable{};
+    uintptr_t black_rhi_first_virtual{};
+    if (module == 0 ||
+        !daysgone_read_value(module + kBlackDummyPooledTargetRva, black_pooled_target) ||
+        black_pooled_target == 0 ||
+        !daysgone_read_value(black_pooled_target + 0x10, black_rhi_texture) ||
+        black_rhi_texture == 0 ||
+        !daysgone_read_value(black_rhi_texture, black_rhi_vtable) ||
+        black_rhi_vtable == 0 ||
+        !daysgone_read_value(black_rhi_vtable, black_rhi_first_virtual) ||
+        black_rhi_first_virtual == 0 ||
+        !is_executable_process_range(black_rhi_first_virtual, 1))
+    {
+        SPDLOG_WARNING_EVERY_N_SEC(
+            5,
+            "[DaysGone][AHUD] BlackDummy is not ready; preserving the original Bend Slate composite");
+        return false;
+    }
+
+    replacement_rhi_texture = black_rhi_texture;
+    const auto suppressed = m_daysgone_bend_taa_slate_suppressed.fetch_add(1) + 1;
+    SPDLOG_INFO_EVERY_N_SEC(
+        5,
+        "[DaysGone][AHUD] Redirected {} SlateCompositeTexture to transparent BlackDummy "
+        "pass={:x} pooled={:x} captured_wrapper={:x} capture_frame={} native={:x} "
+        "slate={:x} black={:x} count={}",
+        variant,
+        pass,
+        slate_pooled_target,
+        matched_capture_wrapper,
+        matched_capture_frame,
+        reinterpret_cast<uintptr_t>(slate_candidate.native),
+        slate_rhi_texture,
+        black_rhi_texture,
+        (unsigned long long)suppressed);
+
+    return true;
 }
 
 void FFakeStereoRenderingHook::update_daysgone_ui_telemetry() {
@@ -23987,7 +26369,23 @@ void FFakeStereoRenderingHook::update_daysgone_bend_ui_placement_fix() {
     }
 
     auto vr = VR::get();
-    const bool enabled = vr != nullptr && vr->is_daysgone_bend_ui_placement_fix_enabled();
+    const bool ahud_owns_ui =
+        vr != nullptr &&
+        vr->get_runtime() != nullptr &&
+        vr->get_runtime()->is_openxr() &&
+        vr->is_hmd_active() &&
+        vr->is_ahud_compatibility_enabled();
+    const bool enabled =
+        vr != nullptr &&
+        vr->is_daysgone_bend_ui_placement_fix_enabled() &&
+        !ahud_owns_ui;
+
+    // The AHUD route consumes Bend's final Slate intermediate, so newly opened
+    // menus and resized windows are picked up by the render-target hook. Do not
+    // rescan or rewrite the UObject widget tree from a periodic watchdog.
+    if (ahud_owns_ui) {
+        SPDLOG_INFO_ONCE("[DaysGone][AHUD] Final-Slate tracking replaces the widget reapply watchdog");
+    }
     if (!enabled && !m_daysgone_bend_ui_originals.captured && !daysgone_has_slate_widget_originals() &&
         !g_daysgone_slate_composite_cvar.forced)
     {
@@ -24071,7 +26469,16 @@ void FFakeStereoRenderingHook::update_daysgone_bend_ui_placement_fix() {
         }
 
         auto vr = VR::get();
-        if (vr != nullptr && vr->is_daysgone_bend_ui_placement_fix_enabled()) {
+        const bool ahud_owns_ui =
+            vr != nullptr &&
+            vr->get_runtime() != nullptr &&
+            vr->get_runtime()->is_openxr() &&
+            vr->is_hmd_active() &&
+            vr->is_ahud_compatibility_enabled();
+        if (vr != nullptr &&
+            vr->is_daysgone_bend_ui_placement_fix_enabled() &&
+            !ahud_owns_ui)
+        {
             apply_daysgone_bend_ui_placement_fix_game_thread();
         } else {
             restore_daysgone_bend_ui_placement_fix_game_thread();
@@ -27554,12 +29961,12 @@ bool VRRenderTargetManager_Base::create_dedicated_ui_texture() {
             }
 
             // UKismetRenderingLibrary uses WorldContextObject as both the world
-            // lookup and the new render target's Outer. ES2 replaces UWorld
-            // during the opening cinematic, so a world-owned UI target is
-            // collected while Slate/RDG can still reference its RHI resource.
-            // UGameInstance resolves the same world but persists across travel.
+            // lookup and the new render target's Outer. These guarded titles
+            // replace UWorld during travel, so keep the rooted UI object under
+            // the persistent GameInstance instead of the retiring world.
             auto* world_context = (sdk::UObject*)world;
             if (everspace2_is_current_game() ||
+                pokemon_emerald_is_current_game() ||
                 is_ue58_dx11_dedicated_ui_backend() ||
                 supports_bimbo_ue58_dx12_owned_ui_target() ||
                 supports_naruto_ue416_dedicated_ui_target() ||
@@ -27576,6 +29983,10 @@ bool VRRenderTargetManager_Base::create_dedicated_ui_texture() {
                         SPDLOG_INFO_EVERY_N_SEC(
                             2,
                             "[Everspace2][UE5.5][SlateUI] Delaying dedicated UI creation until the persistent GameInstance is ready");
+                    } else if (pokemon_emerald_is_current_game()) {
+                        SPDLOG_INFO_EVERY_N_SEC(
+                            2,
+                            "[PokemonEmerald][UE5.6][SlateUI] Delaying dedicated UI creation until the persistent GameInstance is ready");
                     } else if (supports_dead_island_2_ue425_dedicated_ui_target()) {
                         SPDLOG_INFO_EVERY_N_SEC(
                             2,
@@ -28040,11 +30451,26 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
 
     SPDLOG_INFO("Creating scene capture!");
 
-    auto kismet_rendering = sdk::UKismetRenderingLibrary::get();
+    sdk::UKismetRenderingLibrary* kismet_rendering{};
+    if (const auto kismet_rendering_class = sdk::UKismetRenderingLibrary::static_class();
+        kismet_rendering_class != nullptr)
+    {
+        kismet_rendering =
+            kismet_rendering_class->get_class_default_object<sdk::UKismetRenderingLibrary>();
+    }
 
-    if (kismet_rendering == nullptr) {
+    const auto use_daysgone_legacy_target =
+        kismet_rendering == nullptr &&
+        daysgone_is_current_game() &&
+        g_framework != nullptr &&
+        g_framework->is_dx11();
+    if (kismet_rendering == nullptr && !use_daysgone_legacy_target) {
         SPDLOG_ERROR("[VRRenderTargetManager] Failed to get UKismetRenderingLibrary!");
         return false;
+    }
+
+    if (use_daysgone_legacy_target) {
+        SPDLOG_INFO_ONCE("[DaysGone][NativeFix] Kismet render-target factory is absent; using the validated UE4.11 native factory");
     }
 
     static auto scene_capture_c = sdk::USceneCaptureComponent2D::static_class();
@@ -28089,7 +30515,22 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         return false;
     }
 
-    this->scene_capture_component = (sdk::USceneCaptureComponent2D*)this->scene_capture_actor->add_component_by_class(scene_capture_c, false);
+    const auto use_daysgone_legacy_component =
+        daysgone_is_current_game() &&
+        g_framework != nullptr &&
+        g_framework->is_dx11();
+    if (use_daysgone_legacy_component) {
+        // UE4.11 UGameplayStatics::SpawnObject rejects UActorComponent classes.
+        // Construct and register this transient component through validated
+        // Days Gone engine routines instead of entering the known-null path.
+        this->scene_capture_component = create_daysgone_legacy_scene_capture_component(
+            this->scene_capture_actor,
+            scene_capture_c,
+            world);
+    } else {
+        this->scene_capture_component = static_cast<sdk::USceneCaptureComponent2D*>(
+            this->scene_capture_actor->add_component_by_class(scene_capture_c, false));
+    }
 
     if (this->scene_capture_component == nullptr) {
         SPDLOG_ERROR("[VRRenderTargetManager] Failed to add scene capture component!");
@@ -28097,7 +30538,24 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     }
 
     const float clear_color[4] {0.0f, 0.0f, 0.0f, 1.0f};
-    auto tgt_raw = kismet_rendering->create_render_target_2d(world, VR::get()->get_hmd_width(), VR::get()->get_hmd_height(), 2, clear_color, false);
+    const auto target_width = VR::get()->get_hmd_width();
+    const auto target_height = VR::get()->get_hmd_height();
+    sdk::UTexture* tgt_raw{};
+    if (kismet_rendering != nullptr) {
+        tgt_raw = kismet_rendering->create_render_target_2d(
+            world,
+            target_width,
+            target_height,
+            2,
+            clear_color,
+            false);
+    } else {
+        tgt_raw = create_daysgone_legacy_render_target(
+            ugs,
+            world,
+            target_width,
+            target_height);
+    }
 
     if (tgt_raw == nullptr) {
         SPDLOG_ERROR("[VRRenderTargetManager] Failed to create texture!");
@@ -28107,7 +30565,9 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     sdk::UObjectReference tgt{tgt_raw};
 
     SPDLOG_INFO("[VRRenderTargetManager] Created texture target: {:x}", (uintptr_t)tgt.get());
-    this->scene_capture_actor->finish_add_component(this->scene_capture_component);
+    if (!use_daysgone_legacy_component) {
+        this->scene_capture_actor->finish_add_component(this->scene_capture_component);
+    }
 
     this->scene_capture_component->set_texture_target(tgt);
 
