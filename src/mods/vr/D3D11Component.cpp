@@ -512,6 +512,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         spdlog::error("[VR] Failed to get back buffer.");
         m_engine_tex_ref.reset();
         m_scene_capture_tex_ref.reset();
+        m_scene_capture_snapshot_transaction = 0;
         return vr::VRCompositorError_None;
     }
 
@@ -635,18 +636,56 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
     }
 
     const auto& ffsr = VR::get()->m_fake_stereo_hook;
+    namespace frame_diag = uevr::native_frame;
+    frame_diag::Ticket native_frame_ticket{};
     auto native_stereo_packet = ffsr != nullptr
-        ? ffsr->get_native_stereo_frame_packet_for_submit(vr->m_render_frame_count)
+        ? ffsr->get_native_stereo_frame_packet_for_submit(vr->m_render_frame_count, frame_diag::Backend::d3d11, &native_frame_ticket)
         : nullptr;
+    const auto record_native_submit = [&](frame_diag::Runtime api, frame_diag::Stage stage, int32_t result = 0, uint8_t eye = 2) {
+        if (native_frame_ticket && native_stereo_packet != nullptr && ffsr != nullptr) {
+            ffsr->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                frame_diag::Backend::d3d11, api, stage, result, eye);
+        }
+    };
     D3D11_TEXTURE2D_DESC scene_capture_desc{};
     bool scene_capture_packet_ready = false;
+    bool daysgone_snapshot_deferred = false;
 
     if (vr->is_native_stereo_fix_enabled() && native_stereo_packet != nullptr) {
         ComPtr<ID3D11Texture2D> scene_capture_rt{};
         ComPtr<ID3D11Device> scene_capture_device{};
         const auto capture = native_stereo_packet->capture;
-        const auto query_result = capture != nullptr
-            ? capture->native_resource.As(&scene_capture_rt)
+        std::shared_ptr<const D3D11Hook::DaysGoneNativeSnapshot> daysgone_snapshot{};
+        IUnknown* selected_native_resource = capture != nullptr
+            ? capture->native_resource.Get()
+            : nullptr;
+
+        const bool expects_daysgone_snapshot =
+            is_daysgone_executable() &&
+            native_stereo_packet->d3d11_snapshot_transaction != 0;
+        if (expects_daysgone_snapshot) {
+            auto& d3d11_hook = g_framework->get_d3d11_hook();
+            daysgone_snapshot = d3d11_hook != nullptr
+                ? d3d11_hook->get_daysgone_native_snapshot(
+                    native_stereo_packet->d3d11_snapshot_transaction,
+                    native_stereo_packet->capture_generation)
+                : nullptr;
+            if (daysgone_snapshot == nullptr) {
+                daysgone_snapshot_deferred = true;
+                selected_native_resource = nullptr;
+                SPDLOG_WARNING_EVERY_N_SEC(
+                    2,
+                    "[DaysGone][NativeFix][D3D11] Waiting for persistent snapshot transaction {} "
+                    "generation {} at Present",
+                    native_stereo_packet->d3d11_snapshot_transaction,
+                    native_stereo_packet->capture_generation);
+            } else {
+                selected_native_resource = daysgone_snapshot->texture.Get();
+            }
+        }
+
+        const auto query_result = selected_native_resource != nullptr
+            ? selected_native_resource->QueryInterface(IID_PPV_ARGS(&scene_capture_rt))
             : E_NOINTERFACE;
 
         if (SUCCEEDED(query_result) && scene_capture_rt != nullptr) {
@@ -658,7 +697,8 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 scene_capture_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
                 scene_capture_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
             const bool desc_valid =
-                scene_capture_device.Get() == device && bgra_compatible &&
+                scene_capture_device.Get() == device &&
+                bgra_compatible &&
                 scene_capture_desc.Width == static_cast<uint32_t>(vr->get_hmd_width()) &&
                 scene_capture_desc.Height == static_cast<uint32_t>(vr->get_hmd_height()) &&
                 scene_capture_desc.MipLevels == 1 && scene_capture_desc.ArraySize == 1 &&
@@ -668,33 +708,59 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 const auto view_format = scene_capture_desc.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
                     ? DXGI_FORMAT_B8G8R8A8_UNORM
                     : scene_capture_desc.Format;
+                const auto selected_generation = daysgone_snapshot != nullptr
+                    ? daysgone_snapshot->capture_generation
+                    : capture->generation;
+                const auto selected_transaction = daysgone_snapshot != nullptr
+                    ? native_stereo_packet->d3d11_snapshot_transaction
+                    : uint64_t{};
 
-                if (m_scene_capture_generation != capture->generation ||
+                if (m_scene_capture_generation != selected_generation ||
+                    m_scene_capture_snapshot_transaction != selected_transaction ||
                     scene_capture_rt.Get() != m_scene_capture_tex_ref.tex.Get())
                 {
+                    const bool generation_changed =
+                        m_scene_capture_generation != selected_generation;
                     m_scene_capture_tex_ref.reset();
                     m_scene_capture_generation = 0;
+                    m_scene_capture_snapshot_transaction = 0;
                     if (m_scene_capture_tex_ref.set(scene_capture_rt.Get(), view_format, view_format)) {
-                        m_scene_capture_generation = capture->generation;
+                        m_scene_capture_generation = selected_generation;
+                        m_scene_capture_snapshot_transaction = selected_transaction;
                         m_scene_capture_width = scene_capture_desc.Width;
                         m_scene_capture_height = scene_capture_desc.Height;
-                        spdlog::info(
-                            "[NativeStereoFix][D3D11] Accepted scene capture generation {} format {} {}x{}",
-                            capture->generation,
-                            static_cast<uint32_t>(scene_capture_desc.Format),
-                            scene_capture_desc.Width,
-                            scene_capture_desc.Height);
+                        if (generation_changed) {
+                            spdlog::info(
+                                "[NativeStereoFix][D3D11] Accepted scene capture generation {} transaction {} format {} {}x{}",
+                                selected_generation,
+                                selected_transaction,
+                                static_cast<uint32_t>(scene_capture_desc.Format),
+                                scene_capture_desc.Width,
+                                scene_capture_desc.Height);
+                        } else {
+                            SPDLOG_INFO_EVERY_N_SEC(
+                                30,
+                                "[NativeStereoFix][D3D11] Scene capture remains active at generation {} transaction {} format {} {}x{}",
+                                selected_generation,
+                                selected_transaction,
+                                static_cast<uint32_t>(scene_capture_desc.Format),
+                                scene_capture_desc.Width,
+                                scene_capture_desc.Height);
+                        }
                     }
                 }
 
                 scene_capture_packet_ready =
-                    m_scene_capture_generation == capture->generation &&
+                    m_scene_capture_generation == selected_generation &&
+                    m_scene_capture_snapshot_transaction == selected_transaction &&
                     m_scene_capture_tex_ref.has_texture();
             } else {
                 SPDLOG_WARNING_EVERY_N_SEC(
                     2,
                     "[NativeStereoFix][D3D11] Rejecting capture generation {} device_match={} format={} size={}x{} mips={} array={} samples={}",
-                    capture->generation,
+                    daysgone_snapshot != nullptr
+                        ? daysgone_snapshot->capture_generation
+                        : (capture != nullptr ? capture->generation : uint64_t{}),
                     scene_capture_device.Get() == device,
                     static_cast<uint32_t>(scene_capture_desc.Format),
                     scene_capture_desc.Width,
@@ -706,7 +772,10 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         }
     }
 
-    if (native_stereo_packet != nullptr && !scene_capture_packet_ready && ffsr != nullptr) {
+    if (native_stereo_packet != nullptr && !scene_capture_packet_ready &&
+        !daysgone_snapshot_deferred &&
+        native_stereo_packet->d3d11_snapshot_transaction == 0 && ffsr != nullptr)
+    {
         ffsr->reject_native_stereo_frame_packet(
             native_stereo_packet->serial,
             "D3D11 rejected the capture resource or its views");
@@ -718,6 +787,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         if (native_stereo_packet == nullptr &&
             vr->is_native_stereo_fix_enabled() &&
             m_scene_capture_generation != 0 &&
+            m_scene_capture_snapshot_transaction == 0 &&
             m_scene_capture_tex_ref.has_texture())
         {
             const auto current_capture = ffsr != nullptr
@@ -735,6 +805,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         if (!cached_capture_is_current) {
             m_scene_capture_tex_ref.reset();
             m_scene_capture_generation = 0;
+            m_scene_capture_snapshot_transaction = 0;
             m_scene_capture_width = 0;
             m_scene_capture_height = 0;
         }
@@ -1144,7 +1215,9 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
             };
             const auto left_bounds = vr::VRTextureBounds_t{runtime->view_bounds[0][0], runtime->view_bounds[0][2],
                                                            runtime->view_bounds[0][1], runtime->view_bounds[0][3]};
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 0);
             const auto e = vr::VRCompositor()->Submit(vr::Eye_Left, &left_eye, &left_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 0);
 
             if (e != vr::VRCompositorError_None) {
                 spdlog::error("[VR] VRCompositor failed to submit left eye: {}", (int)e);
@@ -1219,6 +1292,8 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 if (native_stereo_packet == nullptr || !m_scene_capture_tex_ref.has_texture()) {
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), nullptr);
                 } else {
+                    // copy invokes this callback synchronously; the local packet
+                    // and ticket remain owned by this submit invocation.
                     m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, nullptr, [&](ID3D11Texture2D* render_target) {
                         D3D11_BOX left_src_box{
                             .left = 0,
@@ -1248,6 +1323,11 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                             0,
                             &right_src_box);
                         if (native_stereo_packet != nullptr) {
+                            if (native_frame_ticket) {
+                                ffsr->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                                    frame_diag::Backend::d3d11, frame_diag::Runtime::openxr, frame_diag::Stage::copy_recorded,
+                                    0, 2, 0, m_scene_capture_tex_ref.tex.Get(), render_target);
+                            }
                             ffsr->note_native_stereo_frame_packet_consumed(native_stereo_packet->serial);
                         }
                     });
@@ -1292,7 +1372,9 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 }
             }
             
+            record_native_submit(frame_diag::Runtime::openxr, frame_diag::Stage::submit_attempt);
             auto result = vr->m_openxr->end_frame(quad_layers, scene_depth_tex != nullptr);
+            record_native_submit(frame_diag::Runtime::openxr, frame_diag::Stage::submit_result, static_cast<int32_t>(result));
 
             vr->m_openxr->needs_pose_update = true;
             vr->m_submitted = result == XR_SUCCESS;
@@ -1333,7 +1415,9 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 };
                 const auto left_bounds = vr::VRTextureBounds_t{runtime->view_bounds[0][0], runtime->view_bounds[0][2],
                                                                runtime->view_bounds[0][1], runtime->view_bounds[0][3]};
+                record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 0);
                 e = vr::VRCompositor()->Submit(vr::Eye_Left, &left_eye, &left_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+                record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 0);
 
                 if (e != vr::VRCompositorError_None) {
                     spdlog::error("[VR] VRCompositor failed to submit left eye: {}", (int)e);
@@ -1383,6 +1467,11 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
 
                 context->CopySubresourceRegion(m_right_eye_tex.Get(), 0, 0, 0, 0, m_scene_capture_tex_ref.tex.Get(), 0, &right_src_box);
                 if (native_stereo_packet != nullptr) {
+                    if (native_frame_ticket) {
+                        ffsr->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                            frame_diag::Backend::d3d11, frame_diag::Runtime::openvr, frame_diag::Stage::copy_recorded,
+                            0, 1, 0, m_scene_capture_tex_ref.tex.Get(), m_right_eye_tex.Get());
+                    }
                     ffsr->note_native_stereo_frame_packet_consumed(native_stereo_packet->serial);
                 }
             }
@@ -1400,7 +1489,9 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
             };
             const auto right_bounds = vr::VRTextureBounds_t{runtime->view_bounds[1][0], runtime->view_bounds[1][2],
                                                             runtime->view_bounds[1][1], runtime->view_bounds[1][3]};
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 1);
             e = vr::VRCompositor()->Submit(vr::Eye_Right, &right_eye, &right_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 1);
             runtime->frame_synced = false;
 
             bool submitted = true;
@@ -1629,6 +1720,7 @@ void D3D11Component::on_reset(VR* vr) {
     m_extreme_compat_backbuffer_ctx.reset();
     m_scene_capture_tex_ref.reset();
     m_scene_capture_generation = 0;
+    m_scene_capture_snapshot_transaction = 0;
     m_scene_capture_width = 0;
     m_scene_capture_height = 0;
     m_left_eye_tex.Reset();

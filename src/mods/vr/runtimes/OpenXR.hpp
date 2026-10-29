@@ -1,6 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <array>
+#include <optional>
+#include <utility>
 #include <unordered_set>
 #include <deque>
 #include <chrono>
@@ -22,6 +25,7 @@
 #include <sdk/Math.hpp>
 
 #include "Mod.hpp"
+#include "../ControllerTouchBindings.hpp"
 
 #include "VRRuntime.hpp"
 
@@ -154,8 +158,12 @@ public:
     std::string get_path_string(XrPath path) const;
     std::string get_session_state_string(XrSessionState state) const;
     XrPath get_path(const std::string& path) const;
-    std::string get_current_interaction_profile() const;
-    XrPath get_current_interaction_profile_path() const;
+    std::string get_current_interaction_profile(VRRuntime::Hand hand = VRRuntime::Hand::LEFT) const;
+    XrPath get_current_interaction_profile_path(VRRuntime::Hand hand = VRRuntime::Hand::LEFT) const;
+    void refresh_frame_controller_types();
+    XrPath frame_interaction_profile_path{XR_NULL_PATH};
+    std::chrono::steady_clock::time_point last_frame_controller_refresh{};
+    int frame_binding_editor_hand{};
 
     std::optional<std::string> initialize_actions(const std::string& json_string);
 
@@ -206,7 +214,7 @@ public:
 
     void trigger_haptic_vibration(float duration, float frequency, float amplitude, VRRuntime::Hand source) const;
     void display_bindings_editor();
-    void save_bindings();
+    void save_bindings(const std::string& interaction_profile = {});
 
 public: 
     // OpenXR specific fields
@@ -363,6 +371,25 @@ public:
 
     PipelineState last_submit_state{};
     PipelineState get_submit_state();
+    struct Stalker2PairSubmit {
+        std::array<XrView, 2> views{};
+        uint64_t epoch{}, generation{};
+        uint32_t source_frame{};
+        bool reused{};
+        bool scene_available{true};
+    };
+    void set_stalker2_pair_submit(std::optional<Stalker2PairSubmit> value) {
+        std::scoped_lock lock{sync_assignment_mtx}; m_stalker2_pair_submit = std::move(value);
+        m_stalker2_pair_pending.store(m_stalker2_pair_submit.has_value(), std::memory_order_release);
+    }
+    std::optional<Stalker2PairSubmit> take_stalker2_pair_submit() {
+        if (!m_stalker2_pair_pending.load(std::memory_order_acquire)) { return std::nullopt; }
+        std::scoped_lock lock{sync_assignment_mtx};
+        m_stalker2_pair_pending.store(false, std::memory_order_release);
+        return std::exchange(m_stalker2_pair_submit, std::nullopt);
+    }
+    std::optional<Stalker2PairSubmit> m_stalker2_pair_submit{}; // sync_assignment_mtx
+    std::atomic_bool m_stalker2_pair_pending{};
     bool capture_everspace2_submit_snapshot(uint32_t frame_count, PipelineState& snapshot);
     bool is_everspace2_snapshot_fresh(
         const PipelineState& snapshot,
@@ -668,7 +695,7 @@ public:
         std::vector<VectorActivator> vector_activators{};
     };
 
-    static inline std::vector<InteractionBinding> s_bindings_map {
+    static inline std::vector<InteractionBinding> s_bindings_map = uevr::controller_touch::add_openxr_controls<InteractionBinding>({
         {"/user/hand/*/input/aim/pose", "pose"},
         {"/user/hand/*/input/grip/pose", "grippose"},
         {"/user/hand/*/input/trigger", "trigger"}, // oculus?
@@ -709,7 +736,7 @@ public:
         {"/user/hand/*/input/trackpad", "touchpad"}, // vive & others
         {"/user/hand/*/input/trackpad/click", "touchpadclick"}, // vive & others
         {"/user/hand/*/output/haptic", "haptic"}, // most of them
-    };
+    });
 
     static inline std::vector<ActionVectorAssociation> s_action_vector_associations {
         { 

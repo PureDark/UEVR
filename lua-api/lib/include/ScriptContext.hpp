@@ -76,6 +76,19 @@ public:
         return m_mtx;
     }
 
+    template<typename T>
+    void dispatch_if_active(T&& fn) {
+        std::scoped_lock _{m_mtx};
+        if (!m_callbacks_retired) {
+            fn();
+        }
+    }
+
+    void retire_callbacks() {
+        std::scoped_lock _{m_mtx};
+        m_callbacks_retired = true;
+    }
+
     void script_reset() {
         std::scoped_lock _{m_mtx};
 
@@ -142,12 +155,15 @@ private:
     static inline std::vector<void*> s_callbacks_to_remove{};
     static inline std::mutex s_callbacks_to_remove_mtx{};
 
+    // Destroyed last: state_view also owns registry references that must be
+    // released before closing a VM retained only by this context.
+    std::shared_ptr<sol::state> m_lua_shared{};
     sol::state_view m_lua;
-    std::shared_ptr<sol::state> m_lua_shared{}; // This allows us to keep the state alive (if it was created by ScriptState)
     ScriptErrorState m_last_script_error_state{};
     mutable std::shared_mutex m_script_error_mutex{};
 
     std::recursive_mutex m_mtx{};
+    bool m_callbacks_retired{}; // Protected by m_mtx, including queued snapshot dispatch.
     UEVR_PluginInitializeParam* m_plugin_initialize_param{nullptr};
     std::vector<sol::protected_function> m_on_xinput_get_state_callbacks{};
     std::vector<sol::protected_function> m_on_xinput_set_state_callbacks{};

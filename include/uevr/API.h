@@ -36,7 +36,7 @@ SOFTWARE.
 #define UEVR_OUT
 
 #define UEVR_PLUGIN_VERSION_MAJOR 2
-#define UEVR_PLUGIN_VERSION_MINOR 39
+#define UEVR_PLUGIN_VERSION_MINOR 41
 #define UEVR_PLUGIN_VERSION_PATCH 0
 
 #define UEVR_RENDERER_D3D11 0
@@ -468,6 +468,15 @@ typedef struct {
     void (*exec_ex)(UEVR_UGameViewportClientHandle vp, UEVR_UObjectHandle world, const wchar_t* command, void* output_device);
 } UEVR_UGameViewportClientFunctions;
 
+/* SDK 2.40+: optional size-aware owned FName calls. The legacy FName table
+   and its eight-byte C++ wrapper are unchanged. Never read this extension on
+   a backend older than 2.40. */
+typedef struct {
+    unsigned int (*get_size)();
+    bool (*construct)(void* destination, unsigned int capacity, const wchar_t* text, unsigned int find_type);
+    bool (*copy)(void* destination, unsigned int capacity, UEVR_FNameHandle source);
+} UEVR_OwnedFNameFunctions;
+
 typedef struct {
     const UEVR_SDKFunctions* functions;
     const UEVR_SDKCallbacks* callbacks;
@@ -493,6 +502,7 @@ typedef struct {
     const UEVR_FEnumPropertyFunctions* fenumproperty;
     const UEVR_UFieldFunctions* ufield;
     const UEVR_UGameViewportClientFunctions* game_viewport_client;
+    const UEVR_OwnedFNameFunctions* owned_fname; /* since 2.40 */
 } UEVR_SDKData;
 
 DECLARE_UEVR_HANDLE(UEVR_IVRSystem);
@@ -549,6 +559,16 @@ typedef struct {
 
 DECLARE_UEVR_HANDLE(UEVR_ActionHandle);
 DECLARE_UEVR_HANDLE(UEVR_InputSourceHandle);
+
+typedef struct {
+    bool active;
+    bool pressed;
+} UEVR_DigitalInputState;
+
+typedef struct {
+    bool active;
+    float value;
+} UEVR_AnalogInputState;
 
 typedef struct {
     bool (*is_runtime_ready)();
@@ -618,6 +638,12 @@ typedef struct {
     void (*get_mod_value)(const char* key, char* value, unsigned int value_size);
     void (*save_config)();
     void (*reload_config)();
+    /* SDK 2.41+: append-only controller input API. Older backends have no tail. */
+    const char* (*get_controller_type)(UEVR_InputSourceHandle source);
+    /* Returns byte length excluding NUL. Insufficient buffers receive an empty string. */
+    unsigned int (*get_controller_profile)(UEVR_InputSourceHandle source, char* buffer, unsigned int capacity);
+    void (*get_action_state)(UEVR_ActionHandle action, UEVR_InputSourceHandle source, UEVR_DigitalInputState* out_state);
+    void (*get_action_axis)(UEVR_ActionHandle action, UEVR_InputSourceHandle source, UEVR_AnalogInputState* out_state);
 } UEVR_VRData;
 
 struct lua_State;

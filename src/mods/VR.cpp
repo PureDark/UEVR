@@ -1,5 +1,8 @@
 #define NOMINMAX
 
+#include "vr/ControllerTouchBindings.hpp"
+#include "vr/StockFrameBindingMigration.hpp"
+
 #include <fstream>
 #include <cmath>
 #include <algorithm>
@@ -23,6 +26,7 @@
 #include <utility/ScopeGuard.hpp>
 
 #include <sdk/Globals.hpp>
+#include <sdk/GalacticRacerRuntime.hpp>
 #include <sdk/CVar.hpp>
 #include <sdk/ConsoleManager.hpp>
 #include <sdk/threading/GameThreadWorker.hpp>
@@ -39,6 +43,7 @@
 #include <sdk/Utility.hpp>
 
 #include <tracy/Tracy.hpp>
+#include "utility/SupportDiagnostics.hpp"
 
 #include "Framework.hpp"
 #include "frameworkConfig.hpp"
@@ -46,9 +51,13 @@
 #include "utility/Logging.hpp"
 
 #include "VR.hpp"
+#include "vr/GalacticRacerPanini.hpp"
+#include "vr/GalacticRacerLetterboxing.hpp"
+#include "vr/Stalker2NativePolicy.hpp"
 #include <safetyhook.hpp>
 #include "UObjectHook.hpp"
 #include "GameSpecific.hpp"
+#include "vr/KtjLOpenXRFactory.hpp"
 
 namespace {
 bool is_stalker2_executable_cached();
@@ -364,6 +373,8 @@ std::shared_ptr<VR>& VR::get() {
 }
 
 VR::~VR() {
+    uevr::swgr_panini::shutdown();
+    uevr::swgr_letterbox::shutdown();
     stop_native_openxr_async_wait_worker();
     restore_1666amsterdam_native_postprocess_cvars();
     restore_daysgone_gbuffer_cvar();
@@ -527,6 +538,42 @@ bool is_stalker2_executable_cached() {
     return is_stalker2;
 }
 
+bool is_stalker2_legacy_ue51_runtime_cached() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(utility::get_executable()).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::is_stalker2_legacy_ue51_runtime(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS);
+    }();
+
+    return result;
+}
+
+bool stalker2_native_fix_requires_same_pass_cached() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(utility::get_executable()).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::stalker2_native_fix_requires_same_pass(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS);
+    }();
+
+    return result;
+}
+
 bool is_dune_awakening_executable_cached() {
     static const bool is_dune = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -595,7 +642,7 @@ bool should_defer_game_specific_very_late_openxr_wait(const VRRuntime* runtime, 
     }
 
     const auto game_needs_deferred_wait =
-        is_stalker2_executable_cached() ||
+        is_stalker2_legacy_ue51_runtime_cached() ||
         is_dune_awakening_executable_cached();
 
     if (!game_needs_deferred_wait) {
@@ -1576,6 +1623,15 @@ bool is_mixtape_executable() {
     return is_mixtape;
 }
 
+bool is_the_sinking_city_2_executable() {
+    static const bool is_the_sinking_city_2 = []() {
+        const auto module_path = utility::get_module_pathw(utility::get_executable());
+        return module_path.has_value() && uevr::games::is_the_sinking_city_2_executable_path(*module_path);
+    }();
+
+    return is_the_sinking_city_2;
+}
+
 bool is_halo_campaign_evolved_executable() {
     static const bool is_halo = []() {
         const auto module_path = utility::get_module_pathw(utility::get_executable());
@@ -2408,6 +2464,202 @@ MixtapeAuto2DDecision evaluate_mixtape_auto_2d(sdk::UGameEngine* engine) {
     return {};
 }
 
+struct TheSinkingCity2BinkUiDecision {
+    bool active{false};
+    std::string widget{};
+    std::string player{};
+    std::string url{};
+    std::optional<bool> initialized{};
+    std::optional<bool> playing{};
+    std::optional<bool> paused{};
+};
+
+TheSinkingCity2BinkUiDecision evaluate_the_sinking_city_2_bink_ui(sdk::UGameEngine* engine) try {
+    (void)engine;
+
+    static const std::wstring widget_class_name =
+        L"WidgetBlueprintGeneratedClass /Game/Blueprints/UI/Widgets/Cinematics/BinkVideoWidget.BinkVideoWidget_C";
+    static const std::wstring player_class_name = L"Class /Script/BinkMediaPlayer.BinkMediaPlayer";
+    static constexpr std::wstring_view expected_player_name =
+        L"/NarrationFeatures/VideoStarterBinkPlayer.VideoStarterBinkPlayer";
+
+    sdk::UObject* visible_widget{};
+    for (auto* widget : get_live_objects_by_class_name(widget_class_name)) {
+        const auto in_viewport = call_object_bool_function(widget, L"IsInViewport");
+        const auto visible = call_object_bool_function(widget, L"IsVisible");
+        const bool is_visible = visible.has_value() ? *visible : in_viewport.value_or(false);
+
+        if (is_visible) {
+            visible_widget = widget;
+            break;
+        }
+    }
+
+    if (visible_widget == nullptr) {
+        return {};
+    }
+
+    for (auto* player : get_live_objects_by_class_name(player_class_name)) {
+        const auto player_name = player->get_full_name();
+        if (player_name.find(expected_player_name) == std::wstring::npos) {
+            continue;
+        }
+
+        TheSinkingCity2BinkUiDecision decision{};
+        decision.widget = get_log_object_name(visible_widget);
+        decision.player = utility::narrow(player_name);
+        decision.initialized = call_object_bool_function(player, L"IsInitialized");
+        decision.playing = call_object_bool_function(player, L"IsPlaying");
+        decision.paused = call_object_bool_function(player, L"IsPaused");
+
+        const auto url = read_mixtape_bink_url(player);
+        if (url.has_value()) {
+            decision.url = utility::narrow(*url);
+        }
+
+        // Visibility and initialization intentionally keep the layer active
+        // while Bink is paused; IsPlaying alone drops out on pause screens.
+        decision.active = decision.initialized.value_or(false) &&
+                          url.has_value() && contains_case_insensitive(*url, L".bk2");
+        return decision;
+    }
+
+    return {};
+} catch (...) {
+    SPDLOG_WARNING_EVERY_N_SEC(
+        5,
+        "[TheSinkingCity2][BinkUI] Failed closed while validating the movie widget/player");
+    return {};
+}
+
+safetyhook::InlineHook g_the_sinking_city_2_bink_per_frame_info_hook{};
+std::once_flag g_the_sinking_city_2_bink_per_frame_info_hook_once{};
+std::atomic_bool g_the_sinking_city_2_bink_per_frame_info_hook_ready{false};
+
+// UE5.8.2 Bink's overlay path passes this 32-byte packet immediately before
+// drawing to the viewport target. Redirecting this one packet keeps Bink's
+// decode, timing, pause, and aspect-ratio behavior intact while moving the
+// actual draw into UEVR's dedicated UI texture.
+struct TheSinkingCity2BinkPerFrameInfo {
+    void* rhi_command_list{};
+    void* render_target{};
+    int32_t target_kind{};
+    int32_t width{};
+    int32_t height{};
+    int32_t hdr_output{};
+};
+
+static_assert(sizeof(TheSinkingCity2BinkPerFrameInfo) == 0x20);
+static_assert(offsetof(TheSinkingCity2BinkPerFrameInfo, render_target) == 0x8);
+static_assert(offsetof(TheSinkingCity2BinkPerFrameInfo, width) == 0x14);
+
+void the_sinking_city_2_bink_set_per_frame_info(const TheSinkingCity2BinkPerFrameInfo* frame_info) {
+    if (frame_info == nullptr || frame_info->rhi_command_list == nullptr ||
+        frame_info->render_target == nullptr || frame_info->target_kind != 4 ||
+        frame_info->width <= 0 || frame_info->height <= 0)
+    {
+        g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(frame_info);
+        return;
+    }
+
+    auto& vr = VR::get();
+    if (vr == nullptr || !vr->is_the_sinking_city_2_bink_ui_active()) {
+        g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(frame_info);
+        return;
+    }
+
+    auto& fake_stereo_hook = vr->get_fake_stereo_hook();
+    auto* const render_target_manager =
+        fake_stereo_hook != nullptr ? fake_stereo_hook->get_render_target_manager() : nullptr;
+    auto* const dedicated_ui_target =
+        render_target_manager != nullptr ? render_target_manager->get_dedicated_ui_target() : nullptr;
+    const auto dedicated_ui_width =
+        render_target_manager != nullptr ? render_target_manager->get_dedicated_ui_width() : 0;
+    const auto dedicated_ui_height =
+        render_target_manager != nullptr ? render_target_manager->get_dedicated_ui_height() : 0;
+
+    if (dedicated_ui_target == nullptr || dedicated_ui_width == 0 || dedicated_ui_height == 0 ||
+        dedicated_ui_width > 16384 || dedicated_ui_height > 16384 ||
+        frame_info->render_target == dedicated_ui_target)
+    {
+        g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(frame_info);
+        return;
+    }
+
+    auto redirected = *frame_info;
+    redirected.render_target = dedicated_ui_target;
+    redirected.width = static_cast<int32_t>(dedicated_ui_width);
+    redirected.height = static_cast<int32_t>(dedicated_ui_height);
+    redirected.hdr_output = 0;
+
+    SPDLOG_INFO_ONCE(
+        "[TheSinkingCity2][BinkUI] Redirecting the native Bink overlay from the viewport target {:x} "
+        "({}x{}) to the dedicated UI target {:x} ({}x{})",
+        reinterpret_cast<uintptr_t>(frame_info->render_target),
+        frame_info->width,
+        frame_info->height,
+        reinterpret_cast<uintptr_t>(dedicated_ui_target),
+        dedicated_ui_width,
+        dedicated_ui_height);
+    g_the_sinking_city_2_bink_per_frame_info_hook.call<void>(&redirected);
+}
+
+bool ensure_the_sinking_city_2_bink_target_hook() {
+    std::call_once(g_the_sinking_city_2_bink_per_frame_info_hook_once, []() {
+        const auto module = utility::get_executable();
+        const auto module_size = utility::get_module_size(module).value_or(0);
+        const auto module_base = reinterpret_cast<uintptr_t>(module);
+        const auto module_end = module_base + module_size;
+
+        if (module == nullptr || module_size == 0 || module_end < module_base) {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Executable image was unavailable; leaving Bink rendering untouched");
+            return;
+        }
+
+        // BinkPluginSetPerFrameInfo in the shipped UE5.8.0 executable. The
+        // complete two-MOVUPS body is unique and an update fails open if it
+        // changes rather than falling back to an RVA.
+        static constexpr std::string_view pattern =
+            "0F 10 01 0F 11 05 ? ? ? ? 0F 10 49 10 0F 11 0D ? ? ? ? C3";
+        const auto target = utility::scan(module_base, module_size, std::string{pattern});
+
+        if (!target.has_value()) {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Native Bink target signature was not found; leaving Bink rendering untouched");
+            return;
+        }
+
+        const auto next = *target + 1;
+        if (next >= module_end ||
+            utility::scan(next, module_end - next, std::string{pattern}).has_value())
+        {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Native Bink target signature was ambiguous; leaving Bink rendering untouched");
+            return;
+        }
+
+        auto hook = safetyhook::create_inline(
+            reinterpret_cast<void*>(*target),
+            &the_sinking_city_2_bink_set_per_frame_info,
+            safetyhook::InlineHook::StartDisabled);
+        if (!hook) {
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Failed to create the native Bink target hook; leaving Bink rendering untouched");
+            return;
+        }
+
+        g_the_sinking_city_2_bink_per_frame_info_hook = std::move(hook);
+        const auto enabled = g_the_sinking_city_2_bink_per_frame_info_hook.enable();
+        if (!enabled.has_value()) {
+            (void)g_the_sinking_city_2_bink_per_frame_info_hook.disable();
+            SPDLOG_WARN("[TheSinkingCity2][BinkUI] Failed to enable the native Bink target hook; leaving Bink rendering untouched");
+            return;
+        }
+
+        g_the_sinking_city_2_bink_per_frame_info_hook_ready.store(true, std::memory_order_release);
+        SPDLOG_INFO("[TheSinkingCity2][BinkUI] Native Bink dedicated-UI redirect armed at {:x}", *target);
+    });
+
+    return g_the_sinking_city_2_bink_per_frame_info_hook_ready.load(std::memory_order_acquire);
+}
+
 safetyhook::InlineHook g_halo_electra_present_video_frame_hook{};
 safetyhook::InlineHook g_halo_electra_video_flush_hook{};
 safetyhook::InlineHook g_halo_electra_open_hook{};
@@ -2697,15 +2949,33 @@ bool VR::should_ignore_native_stereo_fix_for_avowed_sync() const {
 }
 
 bool VR::should_force_native_stereo_fix_same_pass() const {
-    if (!m_native_stereo_fix->value() || is_using_afr() || !is_stalker2_executable_cached()) {
+    if (!m_native_stereo_fix->value() || is_using_afr() || !stalker2_native_fix_requires_same_pass_cached()) {
         return false;
     }
 
-    // Stalker2's UE5.1 render-target handoff is only stable with the native
-    // stereo fix using the original same-pass path. Letting this flip live can
-    // invalidate active render state and crash during cutscene/gameplay RT work.
-    SPDLOG_INFO_ONCE("[Stalker2][NativeStereoFix] Forcing Same Stereo Pass while Native Stereo Fix is enabled");
+    // Both validated Stalker2 layouts tear down renderer-owned allocations if
+    // Native Fix preserves a synthetic SECONDARY renderer transaction. Keep
+    // the original same-pass handoff for Native Fix only; Native and Synced
+    // rendering remain unchanged.
+    SPDLOG_INFO_ONCE("[Stalker2][NativeStereoFix] Forcing Same Stereo Pass for the validated runtime");
     return true;
+}
+
+bool VR::is_stalker2_native_fix_experiment_enabled() const {
+    if (!m_stalker2_native_pair_experiment->value() || !is_native_stereo_fix_enabled() ||
+        !g_framework || !g_framework->is_dx12()) { return false; }
+    static const bool target = [] {
+        const auto path = utility::get_module_pathw(utility::get_executable());
+        return path && uevr::stalker2_native::is_executable(*path) &&
+            uevr::games::should_use_stalker2_ue55_native_fix_capture_layout(*path,
+            sdk::search_for_version(utility::get_executable()).value_or(L"0.00"),
+            sdk::get_file_version_info().dwFileVersionMS, true, true);
+    }();
+    const auto* runtime = get_runtime();
+    return uevr::stalker2_native::Scope{m_stalker2_native_pair_experiment->value(), target,
+        g_framework != nullptr && g_framework->is_dx12(), is_native_stereo_fix_enabled(),
+        runtime != nullptr && runtime->is_openxr() && runtime->loaded, is_native_stereo_fix_texture_array_submit_enabled(),
+        is_using_2d_screen()}.enabled();
 }
 
 bool VR::is_native_openxr_async_wait_active() const {
@@ -3106,10 +3376,37 @@ std::optional<std::string> VR::initialize_openvr() {
 std::optional<std::string> VR::initialize_openvr_input() {
     ZoneScopedN(__FUNCTION__);
 
+    {
+        std::scoped_lock _{m_gamepad_recovery_mtx};
+        m_gamepad_recovery.reset();
+    }
     const auto module_directory = Framework::get_persistent_dir();
 
     // write default actions and bindings with the static strings we have
     for (auto& it : m_binding_files) {
+        if (it.first == uevr::steam_frame::binding_file) {
+            const auto result = uevr::steam_frame::migrate_stock_defaults(module_directory / it.first, it.second);
+            using Result = uevr::steam_frame::MigrationResult;
+            if (result == Result::Upgraded) {
+                spdlog::info("Upgraded stock Steam Frame binding file {} with optional touch actions", it.first);
+            } else if (result == Result::Created) {
+                spdlog::info("Writing default binding file {}", it.first);
+            } else if (result == Result::Failed) {
+                spdlog::warn("Could not safely publish Steam Frame binding file {}; existing file was not overwritten", it.first);
+            } else if (result == Result::Preserved) {
+                spdlog::info("Keeping customized or unreadable Steam Frame binding file {}", it.first);
+            }
+            continue;
+        }
+        if (it.first == uevr::controller_touch::openvr_file && std::filesystem::exists(module_directory / it.first) &&
+            !uevr::controller_touch::can_upgrade_saved_defaults(module_directory / it.first, it.second)) {
+            spdlog::info("Keeping customized Touch binding file {}; bind the optional touch actions manually if needed", it.first);
+            continue;
+        }
+        if (!uevr::steam_frame::write_default_binding(it.first, std::filesystem::exists(module_directory / it.first))) {
+            spdlog::info("Keeping customized Steam Frame binding file {}", it.first);
+            continue;
+        }
         spdlog::info("Writing default binding file {}", it.first);
 
         std::ofstream file{ module_directory / it.first };
@@ -3217,7 +3514,8 @@ std::optional<std::string> VR::initialize_openxr() {
 
                 const std::unordered_set<std::string> wanted_extensions{
                     XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-                    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME
+                    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
+                    uevr::steam_frame::extension
                     // To be seen if we need more!
                 };
 
@@ -3264,7 +3562,25 @@ std::optional<std::string> VR::initialize_openxr() {
         instance_create_info.applicationInfo.applicationName[XR_MAX_APPLICATION_NAME_SIZE - 1] = '\0';
         instance_create_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
         
+        std::unique_ptr<uevr::ktjl::openxr_factory::Repair> ktjl_factory_repair;
+        if (m_ktjl_openxr_factory_repair->value() && g_framework->is_dx12()) {
+            const auto path = utility::get_module_pathw(utility::get_executable());
+            if (path) {
+                ktjl_factory_repair = std::make_unique<uevr::ktjl::openxr_factory::Repair>(true, true,
+                    *path, m_requested_runtime_name->value());
+            }
+        }
+
         result = xrCreateInstance(&instance_create_info, &m_openxr->instance);
+        if (ktjl_factory_repair && ktjl_factory_repair->retry_after_failure(
+                static_cast<int32_t>(result), m_openxr->instance == XR_NULL_HANDLE)) {
+            // Same embedded loader, arguments, extensions, and thread; only WMR's
+            // validated Factory1 import differs during this one bounded retry.
+            result = xrCreateInstance(&instance_create_info, &m_openxr->instance);
+            spdlog::info("[KTJL][OpenXR][FactoryRepair] Corrected create result={}, instance={}",
+                static_cast<int32_t>(result), (void*)m_openxr->instance);
+            ktjl_factory_repair->finish(result == XR_SUCCESS && m_openxr->instance != XR_NULL_HANDLE);
+        }
 
         // we can't convert the result to a string here
         // because the function requires the instance to be valid
@@ -3417,6 +3733,10 @@ std::optional<std::string> VR::initialize_openxr() {
 std::optional<std::string> VR::initialize_openxr_input() {
     ZoneScopedN(__FUNCTION__);
 
+    {
+        std::scoped_lock _{m_gamepad_recovery_mtx};
+        m_gamepad_recovery.reset();
+    }
     if (auto err = m_openxr->initialize_actions(VR::actions_json)) {
         m_openxr->error = err.value();
         spdlog::error("[VR] {}", m_openxr->error.value());
@@ -3572,6 +3892,21 @@ bool VR::is_any_action_down() {
     const auto right_joystick = get_right_joystick();
 
     for (auto& it : m_action_handles) {
+        // Passive sensors and the newly exposed grip axis do not steal gamepad focus.
+        if (uevr::steam_frame::passive_input_action(it.first)) { continue; }
+        if (it.second == m_action_trigger_axis || it.second == m_action_bumper ||
+            it.second == m_action_start_button || it.second == m_action_back_button) {
+            const auto frame_mask = get_runtime()->get_frame_controller_mask();
+            for (unsigned hand = 0; hand < 2; ++hand) {
+                if ((frame_mask & (1u << hand)) == 0) { continue; }
+                const auto source = hand == 0 ? m_left_joystick : m_right_joystick;
+                if (it.second == m_action_trigger_axis) {
+                    const auto axis = read_trigger_axis(source);
+                    if (axis.active && std::isfinite(axis.value) && axis.value > 0.05f) { return true; }
+                } else if (is_action_active(it.second, source)) { return true; }
+            }
+            continue;
+        }
         // These are too easy to trigger
         if (it.second == m_action_thumbrest_touch_left || it.second == m_action_thumbrest_touch_right) {
             continue;
@@ -3598,7 +3933,7 @@ bool VR::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_param) {
 
     if (message == WM_DEVICECHANGE && !m_spoofed_gamepad_connection) {
         spdlog::info("[VR] Received WM_DEVICECHANGE");
-        m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
+        m_last_xinput_spoof_sent.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
     }
 
     return true;
@@ -3611,13 +3946,14 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     const auto now = std::chrono::steady_clock::now();
 
-    if (now - m_last_engine_tick > std::chrono::seconds(1)) {
+    const auto last_engine_tick = m_last_engine_tick.load(std::memory_order_relaxed);
+    if (now - last_engine_tick > uevr::input_recovery::GamepadRecovery::engine_stale_after) {
         const auto mod_frame_delta_ms = m_last_mod_frame.time_since_epoch().count() == 0
             ? -1ll
             : std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_mod_frame).count();
-        const auto tick_delta_ms = m_last_engine_tick.time_since_epoch().count() == 0
+        const auto tick_delta_ms = last_engine_tick.time_since_epoch().count() == 0
             ? -1ll
-            : std::chrono::duration_cast<std::chrono::milliseconds>(now - m_last_engine_tick).count();
+            : std::chrono::duration_cast<std::chrono::milliseconds>(now - last_engine_tick).count();
 
         if (const auto runtime = get_runtime(); runtime != nullptr && runtime->is_openxr()) {
             if (const auto openxr = get_openxr_runtime(); openxr != nullptr) {
@@ -3640,7 +3976,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             SPDLOG_INFO_EVERY_N_SEC(1, "[VR] XInputGetState called, but engine tick hasn't been called in over a second. tick_delta_ms={} mod_frame_delta_ms={}", tick_delta_ms, mod_frame_delta_ms);
         }
 
-        update_action_states();
+        update_action_states(true);
     }
 
     if (*retval == ERROR_SUCCESS) {
@@ -3649,29 +3985,33 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         gamepad_snapturn(*state);
     }
 
-    if (now - m_last_xinput_update > std::chrono::seconds(2)) {
-        m_lowest_xinput_user_index = user_index;
-    }
-
-    if (user_index < m_lowest_xinput_user_index) {
-        m_lowest_xinput_user_index = user_index;
-        spdlog::info("[VR] Changed lowest XInput user index to {}", user_index);
-    }
-
-    if (user_index != m_lowest_xinput_user_index) {
-        if (!m_spoofed_gamepad_connection && is_using_controllers()) {
-            spdlog::info("[VR] XInputGetState called, but user index is {}", user_index);
+    {
+        std::scoped_lock _{m_gamepad_recovery_mtx};
+        if (now - m_last_xinput_update.load(std::memory_order_relaxed) > std::chrono::seconds(2)) {
+            m_lowest_xinput_user_index = user_index;
         }
 
-        return;
-    }
+        if (user_index < m_lowest_xinput_user_index) {
+            m_lowest_xinput_user_index = user_index;
+            spdlog::info("[VR] Changed lowest XInput user index to {}", user_index);
+        }
 
-    if (!m_spoofed_gamepad_connection) {
-        spdlog::info("[VR] Successfully spoofed gamepad connection @ {}", user_index);
+        if (user_index != m_lowest_xinput_user_index) {
+            if (!m_spoofed_gamepad_connection && is_using_controllers()) {
+                spdlog::info("[VR] XInputGetState called, but user index is {}", user_index);
+            }
+
+            return;
+        }
+
+        if (!m_spoofed_gamepad_connection) {
+            spdlog::info("[VR] Successfully spoofed gamepad connection @ {}", user_index);
+        }
+
+        m_last_xinput_update.store(now, std::memory_order_relaxed);
+        m_spoofed_gamepad_connection = true;
+        m_gamepad_recovery.observe_xinput_poll();
     }
-    
-    m_last_xinput_update = now;
-    m_spoofed_gamepad_connection = true;
 
     auto runtime = get_runtime();
 
@@ -3725,11 +4065,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     runtime->handle_pause_select(is_action_active_any_joystick(m_action_system_button));
     do_pause_select();
 
-    const auto& a_button_left = !wants_swap ? m_action_a_button_left : m_action_a_button_right;
-    const auto& a_button_right = !wants_swap ? m_action_a_button_right : m_action_a_button_left;
-
-    const auto is_right_a_button_down = is_action_active_any_joystick(a_button_right);
-    const auto is_left_a_button_down = is_action_active_any_joystick(a_button_left);
+    const auto is_right_a_button_down = is_gamepad_face_action_active(m_action_a_button_right, m_action_a_button_left);
+    const auto is_left_a_button_down = is_gamepad_face_action_active(m_action_a_button_left, m_action_a_button_right);
 
     if (is_right_a_button_down) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_A;
@@ -3739,11 +4076,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_B;
     }
 
-    const auto& b_button_left = !wants_swap ? m_action_b_button_left : m_action_b_button_right;
-    const auto& b_button_right = !wants_swap ? m_action_b_button_right : m_action_b_button_left;
-
-    const auto is_right_b_button_down = is_action_active_any_joystick(b_button_right);
-    const auto is_left_b_button_down = is_action_active_any_joystick(b_button_left);
+    const auto is_right_b_button_down = is_gamepad_face_action_active(m_action_b_button_right, m_action_b_button_left);
+    const auto is_left_b_button_down = is_gamepad_face_action_active(m_action_b_button_left, m_action_b_button_right);
 
     if (is_right_b_button_down) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_X;
@@ -3764,27 +4098,21 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
     }
 
-    const auto is_left_trigger_down = is_action_active(m_action_trigger, left_joystick);
-    const auto is_right_trigger_down = is_action_active(m_action_trigger, right_joystick);
+    state->Gamepad.bLeftTrigger = gamepad_trigger_value(left_joystick, state->Gamepad.bLeftTrigger);
+    state->Gamepad.bRightTrigger = gamepad_trigger_value(right_joystick, state->Gamepad.bRightTrigger);
 
-    if (is_left_trigger_down) {
-        state->Gamepad.bLeftTrigger = 255;
-    }
+    const auto is_right_shoulder_down = is_gamepad_shoulder_pressed(right_joystick);
+    const auto is_left_shoulder_down = is_gamepad_shoulder_pressed(left_joystick);
 
-    if (is_right_trigger_down) {
-        state->Gamepad.bRightTrigger = 255;
-    }
-
-    const auto is_right_grip_down = is_action_active(m_action_grip, right_joystick);
-    const auto is_left_grip_down = is_action_active(m_action_grip, left_joystick);
-
-    if (is_right_grip_down) {
+    if (is_right_shoulder_down) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     }
 
-    if (is_left_grip_down) {
+    if (is_left_shoulder_down) {
         state->Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     }
+
+    apply_frame_gamepad_input(state->Gamepad);
 
     const auto is_dpad_up_down = is_action_active_any_joystick(m_action_dpad_up);
 
@@ -4487,6 +4815,65 @@ void VR::record_ui_layer_pose_sample(
     }
 }
 
+nlohmann::json VR::get_support_diagnostics() {
+    auto cvars = m_cvar_manager->get_diagnostic_snapshot();
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    cvars["snapshot_age_ms"] = cvars.contains("sample_steady_ms")
+        ? nlohmann::json(std::max<int64_t>(0, now_ms - cvars["sample_steady_ms"].get<int64_t>())) : nlohmann::json(nullptr);
+    std::optional<double> cap;
+    if (cvars.contains("values") && cvars["values"].contains("t.MaxFPS") && cvars["values"]["t.MaxFPS"].is_number()) {
+        cap = cvars["values"]["t.MaxFPS"].get<double>();
+    }
+
+    int64_t display_period{};
+    nlohmann::json xr{{"sampled", false}};
+    {
+        // Export must neither race runtime replacement nor wait for render callbacks.
+        std::unique_lock lifetime{m_openvr_mtx, std::try_to_lock};
+        if (!lifetime.owns_lock()) {
+            xr["unavailable_reason"] = "Runtime busy; refresh later";
+        } else if (m_runtime == nullptr || !m_runtime->is_openxr() || m_openxr == nullptr) {
+            xr["unavailable_reason"] = "OpenXR is not the active runtime";
+        } else {
+            const auto& runtime = m_openxr;
+            std::unique_lock events{runtime->event_mtx, std::try_to_lock};
+            std::unique_lock assignment{runtime->sync_assignment_mtx, std::try_to_lock};
+            if (events.owns_lock() && assignment.owns_lock()) {
+                display_period = runtime->frame_state.predictedDisplayPeriod;
+                xr = {{"sampled", true}, {"internal_frame", runtime->internal_frame_count},
+                    {"internal_render_frame", runtime->internal_render_frame_count},
+                    {"pose_age_ms", runtime->get_pose_update_age_ms()},
+                    {"session_state", static_cast<int>(runtime->session_state)}};
+            } else {
+                xr["unavailable_reason"] = "XR state busy; refresh later";
+            }
+        }
+    }
+    const auto ui = get_ui_layer_pose_telemetry_snapshot();
+    nlohmann::json result{
+        {"read_only", true}, {"cvars", std::move(cvars)}, {"openxr", std::move(xr)},
+        {"pacing", utility::support::pacing(display_period, cap)},
+        {"ui_pose_telemetry", {{"sample_count", ui.sample_count},
+            {"last_pose_age_ms", ui.last_pose_age_ms}, {"last_image_age_frames", ui.last_ui_image_age_frames},
+            {"note", "Ages belong to the last telemetry sample, not necessarily this export; zero samples means unavailable."}}},
+        {"native_fix_same_pass", is_native_stereo_fix_same_pass_enabled()},
+        {"native_fix_preserve_secondary_pass", is_native_stereo_fix_preserve_secondary_pass_enabled()},
+    };
+    if (m_fake_stereo_hook != nullptr) {
+        if (const auto rtm = m_fake_stereo_hook->get_render_target_manager(); rtm != nullptr) {
+            const auto capture = rtm->get_scene_capture_target_snapshot();
+            result["native_capture"] = {{"published", capture != nullptr}, {"current_generation", rtm->get_scene_capture_generation()}};
+            if (capture) {
+                result["native_capture"]["published_generation"] = capture->generation;
+                result["native_capture"]["width"] = capture->width;
+                result["native_capture"]["height"] = capture->height;
+            }
+        }
+    }
+    return result;
+}
+
 void VR::record_hitch_snapshot_sample(std::chrono::steady_clock::time_point now) {
     auto& sample = m_hitch_snapshot_samples[m_hitch_snapshot_cursor];
     sample = {};
@@ -4758,7 +5145,7 @@ void VR::dump_hitch_snapshot(std::chrono::steady_clock::duration tick_gap, const
 
 void VR::note_stalker2_transition_stress(const char* reason) {
     if (!m_is_d3d12 || m_openxr == nullptr || get_runtime() == nullptr ||
-        !get_runtime()->is_openxr() || !is_stalker2_executable_cached() ||
+        !get_runtime()->is_openxr() || !is_stalker2_legacy_ue51_runtime_cached() ||
         !m_openxr->got_first_valid_poses)
     {
         return;
@@ -4797,7 +5184,7 @@ void VR::note_stalker2_transition_stress(const char* reason) {
 
 bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
     if (!m_is_d3d12 || m_openxr == nullptr || get_runtime() == nullptr ||
-        !get_runtime()->is_openxr() || !is_stalker2_executable_cached() ||
+        !get_runtime()->is_openxr() || !is_stalker2_legacy_ue51_runtime_cached() ||
         !m_openxr->can_run_frame_loop() || !m_openxr->got_first_valid_poses)
     {
         return false;
@@ -4868,8 +5255,14 @@ bool VR::should_defer_stalker2_openxr_frame_for_transition(const char* reason) {
 void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
+    // Exact Native selection excludes optional Mono/DIBR modes on every branch.
+    const auto letterbox_runtime = get_runtime();
+    uevr::swgr_letterbox::update(m_compatibility_swgr_letterboxing->value(),
+        letterbox_runtime && letterbox_runtime->loaded && is_hmd_active() && !m_disable_vr &&
+        is_using_native_stereo() && !is_using_2d_screen() && !is_splitscreen_compatibility_enabled());
+
     const auto now = std::chrono::steady_clock::now();
-    const auto previous_engine_tick = m_last_engine_tick;
+    const auto previous_engine_tick = m_last_engine_tick.load(std::memory_order_relaxed);
     const bool hitch_diagnostics_enabled = m_enable_hitch_diagnostics->value();
 
     m_cvar_manager->on_pre_engine_tick(engine, delta);
@@ -4889,7 +5282,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
         record_hitch_snapshot_sample(now);
         m_last_hitch_snapshot_sample = now;
     }
-    m_last_engine_tick = now;
+    m_last_engine_tick.store(now, std::memory_order_relaxed);
 
     if (hitch_diagnostics_enabled && previous_engine_tick.time_since_epoch().count() != 0) {
         const auto tick_gap = now - previous_engine_tick;
@@ -5000,6 +5393,8 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     update_subnautica2_native_water_compatibility(engine);
     update_1666amsterdam_native_postprocess_compatibility(engine);
     update_daysgone_gbuffer_compatibility(engine);
+    uevr::swgr_panini::update(m_compatibility_swgr_disable_panini->value(),
+        m_compatibility_swgr_panini_component->value(), is_hmd_active() && !m_disable_vr);
     update_everspace2_cinematic_bars(engine);
 
     update_statistics_overlay(engine);
@@ -5007,6 +5402,7 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     update_shf_auto_2d_mode(engine);
     update_dispatch_auto_2d_mode(engine);
     update_mixtape_auto_2d_mode(engine);
+    update_the_sinking_city_2_bink_ui_state(engine);
     update_halo_electra_cinematic_state(engine);
     update_windrose_meta_ui_auto_2d_mode();
 
@@ -5033,26 +5429,20 @@ void VR::update_imgui_state_from_vr_controller_fallback() {
     XINPUT_STATE state{};
     const auto left_joystick = get_left_joystick();
     const auto right_joystick = get_right_joystick();
-    const auto wants_swap = m_swap_controllers->value();
 
-    const auto& a_button_left = !wants_swap ? m_action_a_button_left : m_action_a_button_right;
-    const auto& a_button_right = !wants_swap ? m_action_a_button_right : m_action_a_button_left;
-    const auto& b_button_left = !wants_swap ? m_action_b_button_left : m_action_b_button_right;
-    const auto& b_button_right = !wants_swap ? m_action_b_button_right : m_action_b_button_left;
-
-    if (is_action_active_any_joystick(a_button_right)) {
+    if (is_gamepad_face_action_active(m_action_a_button_right, m_action_a_button_left)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
     }
 
-    if (is_action_active_any_joystick(a_button_left)) {
+    if (is_gamepad_face_action_active(m_action_a_button_left, m_action_a_button_right)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_B;
     }
 
-    if (is_action_active_any_joystick(b_button_right)) {
+    if (is_gamepad_face_action_active(m_action_b_button_right, m_action_b_button_left)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_X;
     }
 
-    if (is_action_active_any_joystick(b_button_left)) {
+    if (is_gamepad_face_action_active(m_action_b_button_left, m_action_b_button_right)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_Y;
     }
 
@@ -5064,21 +5454,18 @@ void VR::update_imgui_state_from_vr_controller_fallback() {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
     }
 
-    if (is_action_active(m_action_trigger, left_joystick)) {
-        state.Gamepad.bLeftTrigger = 255;
-    }
+    state.Gamepad.bLeftTrigger = gamepad_trigger_value(left_joystick, state.Gamepad.bLeftTrigger);
+    state.Gamepad.bRightTrigger = gamepad_trigger_value(right_joystick, state.Gamepad.bRightTrigger);
 
-    if (is_action_active(m_action_trigger, right_joystick)) {
-        state.Gamepad.bRightTrigger = 255;
-    }
-
-    if (is_action_active(m_action_grip, left_joystick)) {
+    if (is_gamepad_shoulder_pressed(left_joystick)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     }
 
-    if (is_action_active(m_action_grip, right_joystick)) {
+    if (is_gamepad_shoulder_pressed(right_joystick)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
     }
+
+    apply_frame_gamepad_input(state.Gamepad);
 
     if (is_action_active_any_joystick(m_action_dpad_up)) {
         state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
@@ -6071,6 +6458,42 @@ void VR::update_mixtape_auto_2d_mode(sdk::UGameEngine* engine) {
     if (m_mixtape_auto_2d_active.exchange(false, std::memory_order_relaxed)) {
         m_2d_screen_mode->value() = m_mixtape_auto_2d_previous_mode;
         spdlog::info("[Mixtape][Auto2D] active=false restored={}", m_mixtape_auto_2d_previous_mode);
+    }
+}
+
+void VR::update_the_sinking_city_2_bink_ui_state(sdk::UGameEngine* engine) {
+    if (!is_the_sinking_city_2_executable()) {
+        return;
+    }
+
+    (void)ensure_the_sinking_city_2_bink_target_hook();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_the_sinking_city_2_bink_ui_last_sample.time_since_epoch().count() != 0 &&
+        now - m_the_sinking_city_2_bink_ui_last_sample < std::chrono::milliseconds(250))
+    {
+        return;
+    }
+
+    m_the_sinking_city_2_bink_ui_last_sample = now;
+    const auto decision = evaluate_the_sinking_city_2_bink_ui(engine);
+    const bool was_active = m_the_sinking_city_2_bink_ui_active.exchange(decision.active, std::memory_order_acq_rel);
+
+    if (was_active == decision.active) {
+        return;
+    }
+
+    if (decision.active) {
+        spdlog::info(
+            "[TheSinkingCity2][BinkUI] active=true widget={} player={} url={} initialized={} playing={} paused={}",
+            decision.widget.empty() ? "unresolved" : decision.widget,
+            decision.player.empty() ? "unresolved" : decision.player,
+            decision.url.empty() ? "unresolved" : decision.url,
+            decision.initialized.has_value() ? (*decision.initialized ? "true" : "false") : "unresolved",
+            decision.playing.has_value() ? (*decision.playing ? "true" : "false") : "unresolved",
+            decision.paused.has_value() ? (*decision.paused ? "true" : "false") : "unresolved");
+    } else {
+        spdlog::info("[TheSinkingCity2][BinkUI] active=false; native overlay routing is idle");
     }
 }
 
@@ -7536,14 +7959,20 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
             const auto last_frame = (frame_count - 1) % runtimes::OpenXR::QUEUE_SIZE;
             const auto now_frame = frame_count % runtimes::OpenXR::QUEUE_SIZE;
             m_openxr->pipeline_states[now_frame] = m_openxr->pipeline_states[last_frame];
-            if (is_dead_island_2_ue425_executable_cached() && is_using_synchronized_afr()) {
+            const bool nascar_synced = uevr::nascar::is_validated_build() &&
+                is_nascar_code_preserving_mode() && is_using_strict_synchronized_afr();
+            if ((is_dead_island_2_ue425_executable_cached() && is_using_synchronized_afr()) || nascar_synced) {
                 // Synced Sequential consumes the full frame token, not the
                 // circular queue index. Advance it even when this eye reuses
                 // the previous pose or every later eye decision stays stale.
                 m_openxr->pipeline_states[now_frame].frame_count = frame_count;
                 m_openxr->internal_frame_count = frame_count;
-                SPDLOG_INFO_ONCE(
-                    "[DeadIsland2][UE4.25][Synced] Advancing the cloned OpenXR pose with its full frame token");
+                if (nascar_synced) {
+                    SPDLOG_INFO_ONCE("[NASCAR][Synced] Advancing the cloned OpenXR pose with its full frame token");
+                } else {
+                    SPDLOG_INFO_ONCE(
+                        "[DeadIsland2][UE4.25][Synced] Advancing the cloned OpenXR pose with its full frame token");
+                }
             } else {
                 m_openxr->pipeline_states[now_frame].frame_count = now_frame;
             }
@@ -7577,10 +8006,33 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
     runtime->got_first_poses = true;
 }
 
-void VR::update_action_states() {
+bool VR::can_recover_gamepad_input() const {
+    const auto runtime = get_runtime();
+    if (runtime == nullptr) { return false; }
+    if (runtime->is_openxr()) {
+        const auto openxr = get_openxr_runtime();
+        if (openxr == nullptr) { return false; }
+        std::unique_lock focus_lock{openxr->event_mtx, std::try_to_lock};
+        return focus_lock.owns_lock() && uevr::input_recovery::input_focus_allows_recovery(
+            openxr->ready(), openxr->wants_reinitialize, openxr->session_state == XR_SESSION_STATE_FOCUSED);
+    }
+    if (runtime->is_openvr()) {
+        const auto openvr = get_openvr_runtime();
+        return openvr != nullptr && openvr->ready() && !openvr->wants_reinitialize &&
+            openvr->hmd != nullptr && openvr->hmd->IsInputAvailable();
+    }
+    return false;
+}
+
+void VR::update_action_states(bool from_stalled_xinput) {
     ZoneScopedN(__FUNCTION__);
 
-    std::scoped_lock _{m_actions_mtx};
+    std::unique_lock action_lock{m_actions_mtx, std::defer_lock};
+    if (from_stalled_xinput) {
+        if (!action_lock.try_lock()) { return; }
+    } else {
+        action_lock.lock();
+    }
 
     auto runtime = get_runtime();
 
@@ -7588,6 +8040,13 @@ void VR::update_action_states() {
         return;
     }
 
+    if (from_stalled_xinput) {
+        std::scoped_lock recovery_lock{m_gamepad_recovery_mtx};
+        if (!m_gamepad_recovery.request_stalled_poll(std::chrono::steady_clock::now(),
+            m_last_engine_tick.load(std::memory_order_relaxed), [this]() { return can_recover_gamepad_input(); })) {
+            return;
+        }
+    }
     static bool once = true;
 
     if (once) {
@@ -7603,6 +8062,7 @@ void VR::update_action_states() {
 
         if (error != vr::VRInputError_None) {
             spdlog::error("VRInput failed to update action state: {}", (uint32_t)error);
+            m_openvr->frame_controller_profiles.invalidate();
         }
 
         const auto end_time = std::chrono::high_resolution_clock::now();
@@ -7616,7 +8076,8 @@ void VR::update_action_states() {
 
             //reinitialize_openvr();
             runtime->wants_reinitialize = true;
-        }   
+        }
+        if (error == vr::VRInputError_None) { m_openvr->refresh_frame_controller_types(); }
     } else {
         get_runtime()->update_input();
     }
@@ -7628,19 +8089,21 @@ void VR::update_action_states() {
         actively_using_controller = true;
     }
 
-    const auto last_xinput_update_is_late = std::chrono::steady_clock::now() - m_last_xinput_update >= std::chrono::seconds(2);
-    const auto should_be_spoofing = (actively_using_controller || get_runtime()->handle_pause);
+    bool retry_gamepad = false;
+    {
+        std::scoped_lock recovery_lock{m_gamepad_recovery_mtx};
+        const auto recovery_now = std::chrono::steady_clock::now();
+        const auto last_xinput_update_is_late = recovery_now - m_last_xinput_update.load(std::memory_order_relaxed) >=
+            uevr::input_recovery::GamepadRecovery::xinput_stale_after;
+        const auto should_be_spoofing = (actively_using_controller || get_runtime()->handle_pause);
 
-    if (m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
-        m_spoofed_gamepad_connection = false;
-    }
+        if (m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
+            m_spoofed_gamepad_connection = false;
+        }
 
-    if (!m_spoofed_gamepad_connection && last_xinput_update_is_late && should_be_spoofing) {
-        spdlog::info("[VR] Attempting to spoof gamepad connection");
-        g_framework->post_message(WM_DEVICECHANGE, 0, 0);
-        g_framework->activate_window();
-
-        m_last_xinput_spoof_sent = std::chrono::steady_clock::now();
+        retry_gamepad = !m_spoofed_gamepad_connection && m_gamepad_recovery.request_retry(recovery_now,
+            last_xinput_update_is_late, should_be_spoofing, [this]() { return can_recover_gamepad_input(); });
+        if (retry_gamepad) { m_last_xinput_spoof_sent.store(recovery_now, std::memory_order_relaxed); }
     }
 
     /*if (m_recenter_view_key->is_key_down_once()) {
@@ -7659,6 +8122,15 @@ void VR::update_action_states() {
     }
 
     update_dpad_gestures();
+
+    // Window activation can synchronously call another thread's window proc.
+    // Never make that call while holding the action lock needed by XInput.
+    action_lock.unlock();
+    if (retry_gamepad && !m_spoofed_gamepad_connection && can_recover_gamepad_input()) {
+        spdlog::info("[VR] Attempting to spoof gamepad connection");
+        g_framework->post_message(WM_DEVICECHANGE, 0, 0);
+        g_framework->activate_window();
+    }
 }
 
 void VR::update_dpad_gestures() {
@@ -8311,7 +8783,7 @@ void VR::on_frame() {
     }
 
     const auto now = std::chrono::steady_clock::now();
-    const auto is_allowed_draw_window = now - m_last_xinput_update < std::chrono::seconds(2);
+    const auto is_allowed_draw_window = now - m_last_xinput_update.load(std::memory_order_relaxed) < std::chrono::seconds(2);
 
     if (!is_allowed_draw_window) {
         m_rt_modifier.draw = false;
@@ -8723,7 +9195,11 @@ void VR::on_post_present() {
 
     const auto is_same_frame = m_render_frame_count > 0 && m_render_frame_count == m_frame_count;
 
-    m_render_frame_count = m_frame_count;
+    const auto completed_present_frame = m_frame_count;
+    m_render_frame_count = completed_present_frame;
+    if (m_fake_stereo_hook != nullptr) {
+        m_fake_stereo_hook->observe_native_frame_present(completed_present_frame);
+    }
 
     auto runtime = get_runtime();
 
@@ -8956,7 +9432,18 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
     }
 
     if (selected_page == PAGE_UNREAL) {
-        m_rendering_method->draw("Rendering Method");
+        if (uevr::nascar::is_target()) {
+            ImGui::TextWrapped("NASCAR: Native or Synced (Skip Tick) + UI. Ghost Fix uses engine-owned histories in Synced. Native Fix uses validated linked families without image hooks. Reinject after changing HMD resolution while testing Native Fix.");
+            int method = is_nascar_code_preserving_mode() ? m_rendering_method->value() : -1;
+            const char* methods[]{"Native Stereo", "Synced Sequential (Skip Tick)"};
+            if (ImGui::Combo("Rendering Method", &method, methods, 2)) {
+                m_rendering_method->value() = method;
+                m_extreme_compat_mode->value() = false;
+            }
+        } else {
+            m_rendering_method->draw("Rendering Method");
+            m_synced_afr_method->draw("Synced Sequential Method");
+        }
 
         if (is_using_synchronized_afr()) {
             ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
@@ -9054,8 +9541,12 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             ImGui::TextWrapped(
                 "Default is remap-only for safety. Enable bootstrap only if Ghosting Fix stays inactive/"
                 "learning and the game needs UEVR to force Unreal to create a second scene history.");
-            ImGui::TextWrapped(
-                "Risky/legacy path: enable before injection or a scene load when possible; avoid live toggle spam.");
+            if (uevr::nascar::is_target()) {
+                ImGui::TextWrapped("NASCAR: bounded lazy allocation during normal view setup. No PostInitProperties replay, extra rendered views, or protected-image hooks. Native is unchanged.");
+            } else {
+                ImGui::TextWrapped(
+                    "Risky/legacy path: enable before injection or a scene load when possible; avoid live toggle spam.");
+            }
             ImGui::Unindent();
         }
 
@@ -9068,7 +9559,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 draw_status_badge("Native Fix status:", "skipped: Native Stereo rendering required", skipped_color);
             } else if (m_fake_stereo_hook == nullptr) {
                 draw_status_badge("Native Fix status:", "unavailable: stereo hook not installed", blocked_color);
-            } else if (is_native_stereo_fix_enabled()) {
+            } else if (is_native_stereo_fix_enabled() || is_nascar_native_stereo_fix_requested()) {
                 const auto* status = m_fake_stereo_hook->get_native_stereo_fix_status_text();
                 const auto color = m_fake_stereo_hook->is_native_stereo_fix_operational()
                     ? active_color
@@ -9080,6 +9571,7 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 draw_status_badge("Native Fix status:", "skipped: title/runtime guard", blocked_color);
             }
 
+            if (uevr::nascar::is_target()) { ImGui::BeginDisabled(); }
             if (should_force_native_stereo_fix_same_pass()) {
                 m_native_stereo_fix_same_pass->value() = true;
                 ImGui::BeginDisabled();
@@ -9090,6 +9582,16 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             }
             m_native_stereo_fix_preserve_secondary_pass->draw("Preserve Secondary Pass on UE5.5+");
+            if (stalker2_native_fix_requires_same_pass_cached()) {
+                m_stalker2_native_pair_experiment->draw("Experimental Stalker 2 Exact Native Pair");
+                ImGui::TextWrapped("Default off. UE5.5 DX12 Native Fix and OpenXR double-wide only. Requires a validated render/RHI transaction; otherwise retains the existing path. Owned pair reuse is bounded to three frames/100 ms and costs additional GPU memory/bandwidth.");
+                m_stalker2_sharpen_priority->draw("Experimental Stalker 2 Sharpening Priority");
+                ImGui::TextWrapped("Only frozen r.Tonemapper.Sharpen: after three verified mismatches, use its observed game priority without raising it to Console. No other CVar or game is affected. Stops when unfrozen or either experiment/Native Fix is disabled.");
+            }
+            if (uevr::nascar::is_target()) {
+                ImGui::EndDisabled();
+                ImGui::TextWrapped("NASCAR keeps the original eye indices/history and temporarily gives the right singleton a primary pass only while creating its renderer. These generic pass options are not used.");
+            }
             ImGui::TextWrapped(
                 "Recommended for UE5.5 and newer. Keeps the real secondary-eye pass identity for per-eye water, "
                 "post-process, and renderer paths while retaining the Native Fix constructor safety guard. "
@@ -9671,6 +10173,27 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             m_compatibility_head_turn_camera_stabilizer->draw("Head-Turn Camera Stabilizer");
             m_compatibility_ui_layer_pose_telemetry->draw("UI Layer Pose Telemetry");
             m_compatibility_ui_layer_pose_stabilizer->draw("UI Layer Pose Stabilizer");
+            m_compatibility_pre57_slate_ui_observation->draw("Observe UE5.5/5.6 Slate UI (Experimental)");
+            if (m_compatibility_pre57_slate_ui_observation->value() && m_fake_stereo_hook) {
+                ImGui::TextWrapped("%s", m_fake_stereo_hook->get_pre57_slate_ui_observation_status());
+                ImGui::TextWrapped("Read-only discovery: no CVar, alpha, UI destination, allocation or rendering-mode changes. "
+                    "Existing game adapters keep priority. A distinct texture is not proof of main-window or pooled-resource ownership; "
+                    "unknown routes remain unchanged. UE5.4 retains its separate immediate-command-list path. "
+                    "Results are included in Hook Provenance.");
+            }
+            if (sdk::galactic_racer::current_dx12_game()) {
+                m_compatibility_swgr_letterboxing->draw("Galactic Racer Cinematic Letterboxing Fix (Experimental)");
+                if (!m_compatibility_swgr_letterboxing->value()) { uevr::swgr_letterbox::update(false, false); }
+                ImGui::TextWrapped("%s", uevr::swgr_letterbox::status_text(uevr::swgr_letterbox::status()));
+                ImGui::TextWrapped("Opt-in DX12 Native / Native Fix only. Removes only M_PP_CameraLetterboxing, which can black out the right eye during collision cameras. Other post-process materials, UI, alpha, FOV and temporal states are unchanged. Fresh chains handle game re-enables and replacement material instances; no CVar freeze/re-arm. Unsupported code/storage keeps the original path.");
+                m_compatibility_swgr_disable_panini->draw("Galactic Racer Disable Panini - CVar (Experimental)");
+                ImGui::TextWrapped("%s", uevr::swgr_panini::status_text(uevr::swgr_panini::cvar_status()));
+                m_compatibility_swgr_panini_component->draw("Galactic Racer Panini Component Fallback (Experimental)");
+                ImGui::TextWrapped("%s", uevr::swgr_panini::status_text(uevr::swgr_panini::component_status()));
+                ImGui::TextWrapped("Enable only one test. Both default off. CVar uses Gfn.Panini.Enable without raising priority, re-arms game-code resets with limited retries, and restores its owned value when disabled. Console/other external changes remain protected. Component fallback bypasses backend CVar lookup using the validated game's temporary-camera branch for each Tick, immediately restoring the flag. Unsupported builds remain unchanged. No FOV, world scale, alpha, UI or stereo mode changes. Compare at high speed; the cause is not yet runtime-confirmed.");
+                m_compatibility_swgr_bink_seek_budget->draw("Galactic Racer Movie Seek Budget (Experimental)");
+                ImGui::TextWrapped("Opt-in SWGR UE5.7.4 DX12 only. Uses a 6 ms incremental budget for playing, forward-seeking viewport movies and keeps their completed image scheduled while seeking. A full decode can exceed the budget; movie/audio timing needs testing. Enable before playing a movie. Rewinds, paused seeks, texture movies and other games keep the original path.");
+            }
             if (m_compatibility_ui_layer_pose_stabilizer->value()) {
                 ImGui::TextWrapped("OpenXR UE5.7+: latches game UI layer pose to the same frame basis used for scene submit.");
             }
@@ -9788,6 +10311,10 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
         m_show_fps->draw("Show FPS");
         m_show_statistics->draw("Show Engine Statistics");
         m_enable_hitch_diagnostics->draw("Enable Hitch Diagnostics");
+        m_ktjl_openxr_factory_repair->draw("KTJL OpenXR DXGI repair (next launch)");
+        if (m_ktjl_openxr_factory_repair->value()) {
+            ImGui::TextWrapped("Opt-in for the validated KTJL DX12 + WMR runtime only. Restart the game to test. OpenVR and the game's DXGI route are unchanged.");
+        }
         if (m_enable_hitch_diagnostics->value()) {
             ImGui::TextWrapped("Records recent OpenXR/D3D12 state and writes hitch_snapshot JSON files after large tick gaps.");
         } else {
@@ -10229,6 +10756,146 @@ Matrix4x4f VR::get_current_projection_matrix(bool flip) {
     }
 
     return get_runtime()->projections[(uint32_t)VRRuntime::Eye::RIGHT];
+}
+
+uevr::steam_frame::DigitalInput VR::read_digital_input(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const {
+    const auto runtime = get_runtime();
+    if (!runtime->loaded || action == vr::k_ulInvalidActionHandle) { return {}; }
+    if (runtime->is_openvr()) {
+        vr::InputDigitalActionData_t data{};
+        if (vr::VRInput()->GetDigitalActionData(action, &data, sizeof(data), source) == vr::VRInputError_None) {
+            return {data.bActive, data.bState};
+        }
+    } else if (runtime->is_openxr() && source <= VRRuntime::Hand::RIGHT) {
+        const auto xr_action = (XrAction)action;
+        if (!m_openxr->action_set.bool_actions.contains(xr_action)) { return {}; }
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = xr_action;
+        info.subactionPath = m_openxr->hands[source].path;
+        XrActionStateBoolean data{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (xrGetActionStateBoolean(m_openxr->session, &info, &data) == XR_SUCCESS) {
+            return {data.isActive == XR_TRUE, data.currentState == XR_TRUE};
+        }
+    }
+    return {};
+}
+
+uevr::steam_frame::AnalogInput VR::read_trigger_axis(vr::VRInputValueHandle_t source) const {
+    const auto runtime = get_runtime();
+    if (!runtime->loaded || m_action_trigger_axis == vr::k_ulInvalidActionHandle) { return {}; }
+    if (runtime->is_openvr()) {
+        vr::InputAnalogActionData_t data{};
+        if (vr::VRInput()->GetAnalogActionData(m_action_trigger_axis, &data, sizeof(data), source) == vr::VRInputError_None) {
+            return {data.bActive, data.x};
+        }
+    } else if (runtime->is_openxr() && source <= VRRuntime::Hand::RIGHT) {
+        const auto action = (XrAction)m_action_trigger_axis;
+        if (!m_openxr->action_set.float_actions.contains(action)) { return {}; }
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = action;
+        info.subactionPath = m_openxr->hands[source].path;
+        XrActionStateFloat data{XR_TYPE_ACTION_STATE_FLOAT};
+        if (xrGetActionStateFloat(m_openxr->session, &info, &data) == XR_SUCCESS) {
+            return {data.isActive == XR_TRUE, data.currentState};
+        }
+    }
+    return {};
+}
+
+bool VR::is_gamepad_face_action_active(vr::VRActionHandle_t normal, vr::VRActionHandle_t swapped) const {
+    const auto frame_mask = get_runtime()->get_frame_controller_mask();
+    const auto swap = m_swap_controllers->value();
+    if (frame_mask == 0) { return is_action_active_any_joystick(swap ? swapped : normal); }
+    // Frame has all ABXY buttons on one physical hand. Do not exchange their
+    // gamepad labels when swapping the sticks, triggers and VR controller roles.
+    for (unsigned hand = 0; hand < 2; ++hand) {
+        const bool frame = (frame_mask & (1u << hand)) != 0;
+        const auto action = uevr::steam_frame::swap_face_actions(frame, swap) ? swapped : normal;
+        if (is_action_active(action, hand == 0 ? m_left_joystick : m_right_joystick)) { return true; }
+    }
+    return false;
+}
+
+bool VR::is_native_frame_source(vr::VRInputValueHandle_t source) const {
+    const auto frame_mask = get_runtime()->get_frame_controller_mask();
+    return ((frame_mask & 1u) != 0 && source == m_left_joystick) ||
+        ((frame_mask & 2u) != 0 && source == m_right_joystick);
+}
+
+bool VR::is_gamepad_shoulder_pressed(vr::VRInputValueHandle_t source) const {
+    const bool frame = is_native_frame_source(source);
+    return uevr::steam_frame::shoulder_pressed(frame, is_action_active(m_action_grip, source),
+        frame ? read_digital_input(m_action_bumper, source) : uevr::steam_frame::DigitalInput{});
+}
+
+uint8_t VR::gamepad_trigger_value(vr::VRInputValueHandle_t source, uint8_t existing) const {
+    const bool frame = is_native_frame_source(source);
+    return uevr::steam_frame::merge_trigger_value(existing, frame, is_action_active(m_action_trigger, source),
+        frame ? read_trigger_axis(source) : uevr::steam_frame::AnalogInput{});
+}
+
+void VR::apply_frame_gamepad_input(XINPUT_GAMEPAD& gamepad) const {
+    const auto frame_mask = get_runtime()->get_frame_controller_mask();
+    if (frame_mask == 0) { return; }
+    // Menu/View keep their gamepad meanings regardless of the VR hand-swap option.
+    for (unsigned hand = 0; hand < 2; ++hand) {
+        if ((frame_mask & (1u << hand)) == 0) { continue; }
+        const auto source = hand == 0 ? m_left_joystick : m_right_joystick;
+        const auto start = read_digital_input(m_action_start_button, source);
+        const auto back = read_digital_input(m_action_back_button, source);
+        if (start.active && start.pressed) { gamepad.wButtons |= XINPUT_GAMEPAD_START; }
+        if (back.active && back.pressed) { gamepad.wButtons |= XINPUT_GAMEPAD_BACK; }
+    }
+}
+
+std::string VR::get_controller_profile(vr::VRInputValueHandle_t source) const {
+    const auto runtime = get_runtime();
+    if (!runtime->loaded || (runtime->is_openvr() && source == vr::k_ulInvalidInputValueHandle)) { return {}; }
+    if (source == m_left_joystick) { return runtime->frame_controller_profiles.profile(0); }
+    if (source == m_right_joystick) { return runtime->frame_controller_profiles.profile(1); }
+    return {};
+}
+
+const char* VR::get_controller_type(vr::VRInputValueHandle_t source) const {
+    const auto runtime = get_runtime();
+    if (!runtime->loaded || (runtime->is_openvr() && source == vr::k_ulInvalidInputValueHandle)) { return "unknown"; }
+    if (source == m_left_joystick) { return runtime->frame_controller_profiles.type(0); }
+    if (source == m_right_joystick) { return runtime->frame_controller_profiles.type(1); }
+    return "unknown";
+}
+
+uevr::steam_frame::DigitalInput VR::get_action_state(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const {
+    if ((get_runtime()->is_openvr() && source == vr::k_ulInvalidInputValueHandle) ||
+        (source != m_left_joystick && source != m_right_joystick) || action == vr::k_ulInvalidActionHandle ||
+        action == m_action_trigger_axis || action == m_action_squeeze || action == m_action_joystick ||
+        action == m_action_pose || action == m_action_grip_pose || action == m_action_haptic) { return {}; }
+    const auto known = std::any_of(m_action_handles.begin(), m_action_handles.end(),
+        [&](const auto& entry) { return entry.second.get() == action; });
+    return known ? uevr::steam_frame::validated_digital(read_digital_input(action, source)) : uevr::steam_frame::DigitalInput{};
+}
+
+uevr::steam_frame::AnalogInput VR::get_action_axis(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const {
+    const auto runtime = get_runtime();
+    if (!runtime->loaded || (source != m_left_joystick && source != m_right_joystick) ||
+        (runtime->is_openvr() && source == vr::k_ulInvalidInputValueHandle) ||
+        action == vr::k_ulInvalidActionHandle || (action != m_action_trigger_axis && action != m_action_squeeze)) { return {}; }
+    if (runtime->is_openvr()) {
+        vr::InputAnalogActionData_t data{};
+        if (vr::VRInput()->GetAnalogActionData(action, &data, sizeof(data), source) == vr::VRInputError_None) {
+            return uevr::steam_frame::validated_axis({data.bActive, data.x});
+        }
+    } else if (runtime->is_openxr() && source <= VRRuntime::Hand::RIGHT) {
+        const auto xr_action = (XrAction)action;
+        if (!m_openxr->action_set.float_actions.contains(xr_action)) { return {}; }
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = xr_action;
+        info.subactionPath = m_openxr->hands[source].path;
+        XrActionStateFloat data{XR_TYPE_ACTION_STATE_FLOAT};
+        if (xrGetActionStateFloat(m_openxr->session, &info, &data) == XR_SUCCESS) {
+            return uevr::steam_frame::validated_axis({data.isActive == XR_TRUE, data.currentState});
+        }
+    }
+    return {};
 }
 
 bool VR::is_action_active(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const {

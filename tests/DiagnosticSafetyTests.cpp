@@ -1,0 +1,658 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <atomic>
+#include <cstddef>
+#include "../include/uevr/API.h"
+#include "utility/OpaqueStateRegistry.hpp"
+#include <barrier>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <spdlog/sinks/base_sink.h>
+#include "utility/Logging.hpp"
+#include "utility/SupportDiagnostics.hpp"
+#include "utility/UObjectAllocatorDiscovery.hpp"
+#include "utility/SceneCaptureLifecycle.hpp"
+#include "utility/PostInitValidation.hpp"
+#include "utility/PostInitCodeMemory.hpp"
+// Some backend translation units still include Windows headers without NOMINMAX.
+#define max(a, b) windows_max_macro_must_not_expand(a, b)
+#include "mods/vr/CVarDiagnostics.hpp"
+#include "utility/BoundedTextureDiagnostics.hpp"
+#include "utility/GpuRetirement.hpp"
+#include "utility/UObjectMetadataFilter.hpp"
+#include "utility/UObjectArrayBrowser.hpp"
+#undef max
+
+int disabled_log_argument_evaluations();
+int test_cached_cvar_reads();
+int test_console_text();
+int test_discovery_validation();
+int test_cadence_replay();
+int test_ue58_ui_initialization();
+int test_ktjl_openxr_factory();
+int test_uobject_browser_cost();
+int test_buffered_rt_texture_call();
+
+namespace {
+// Existing SDK tables must remain a byte-for-byte prefix for pre-2.40 plugins.
+#define SDK_PREFIX_SLOT(member, index) static_assert(offsetof(UEVR_SDKData, member) == (index) * sizeof(void*))
+SDK_PREFIX_SLOT(functions, 0);
+SDK_PREFIX_SLOT(callbacks, 1);
+SDK_PREFIX_SLOT(uobject, 2);
+SDK_PREFIX_SLOT(uobject_array, 3);
+SDK_PREFIX_SLOT(ffield, 4);
+SDK_PREFIX_SLOT(fproperty, 5);
+SDK_PREFIX_SLOT(ustruct, 6);
+SDK_PREFIX_SLOT(uclass, 7);
+SDK_PREFIX_SLOT(ufunction, 8);
+SDK_PREFIX_SLOT(uobject_hook, 9);
+SDK_PREFIX_SLOT(ffield_class, 10);
+SDK_PREFIX_SLOT(fname, 11);
+SDK_PREFIX_SLOT(console, 12);
+SDK_PREFIX_SLOT(malloc, 13);
+SDK_PREFIX_SLOT(render_target_pool_hook, 14);
+SDK_PREFIX_SLOT(stereo_hook, 15);
+SDK_PREFIX_SLOT(frhitexture2d, 16);
+SDK_PREFIX_SLOT(uscriptstruct, 17);
+SDK_PREFIX_SLOT(farrayproperty, 18);
+SDK_PREFIX_SLOT(fboolproperty, 19);
+SDK_PREFIX_SLOT(fstructproperty, 20);
+SDK_PREFIX_SLOT(fenumproperty, 21);
+SDK_PREFIX_SLOT(ufield, 22);
+SDK_PREFIX_SLOT(game_viewport_client, 23);
+SDK_PREFIX_SLOT(owned_fname, 24);
+#undef SDK_PREFIX_SLOT
+static_assert(sizeof(UEVR_FNameFunctions) == 2 * sizeof(void*));
+static_assert(UEVR_PLUGIN_VERSION_MAJOR == 2 && UEVR_PLUGIN_VERSION_MINOR >= 40);
+
+int failures{};
+void expect(bool value, const char* message) {
+    if (!value) { ++failures; std::cerr << "FAILED: " << message << '\n'; }
+}
+
+void test_scene_capture_lifecycle() {
+    using uevr::scene_capture::component_plan;
+    const auto run = [](bool legacy, bool passive, bool deferred_supported,
+                        bool component_created, bool target_created) {
+        const auto plan = component_plan(legacy, passive, deferred_supported);
+        int finished = component_created && (legacy || !plan.deferred_add) ? 1 : 0;
+        bool configured_before_finish = !plan.finish_after_configuration;
+        if (component_created && target_created) {
+            configured_before_finish = true;
+            finished += plan.finish_after_configuration ? 1 : 0;
+        }
+        return std::pair{finished, configured_before_finish};
+    };
+
+    expect(component_plan(false, false, true).deferred_add &&
+           component_plan(false, false, true).finish_after_configuration,
+        "validated modern/Deadzone captures defer completion until configured");
+    expect(run(false, false, true, true, true) == std::pair{1, true},
+        "deferred captures finish exactly once after target/flags/visibility setup");
+    expect(run(false, false, false, true, true) == std::pair{1, true},
+        "legacy/unknown immediate adds retain registration timing without a second finish");
+    for (bool supported : {false, true}) {
+        expect(run(false, true, supported, true, true).first == 0,
+            "Bodycam passive holders remain unregistered");
+        expect(run(true, false, supported, true, true).first == 1,
+            "Days Gone custom factories are not finished a second time");
+        expect(!component_plan(true, true, supported).deferred_add,
+            "custom legacy factory has precedence over passive/deferred flags");
+    }
+    expect(run(false, false, true, false, true).first == 0,
+        "component creation failure cannot finish a missing component");
+    expect(run(false, false, true, true, false).first == 0,
+        "target creation failure leaves a deferred component unfinished for existing cleanup");
+    for (int generation = 0; generation != 3; ++generation) {
+        expect(run(false, false, true, true, true).first == 1,
+            "retry/recreation uses a fresh per-component lifecycle plan");
+    }
+}
+
+void test_source_post_init_validation() {
+    using uevr::post_init::validates_source_slot_body;
+    const auto validate = [](std::span<const uint8_t> bytes, size_t* reads = nullptr) {
+        constexpr uintptr_t base = 0x1000;
+        return validates_source_slot_body(base, [=](uintptr_t address) -> std::span<const uint8_t> {
+            if (reads) { ++*reads; }
+            if (address < base || address - base >= bytes.size()) { return {}; }
+            return bytes.subspan(address - base, (std::min)(size_t{15}, bytes.size() - (address - base)));
+        });
+    };
+    constexpr std::array<uint8_t, 1> noop{0xC3};
+    constexpr std::array<uint8_t, 3> noop_ret_zero{0xC2,0,0};
+    constexpr std::array<uint8_t, 6> call_return{0xE8,0,0,0,0,0xC3};
+    // A development check: CALL, TEST AL,AL, JE over NOP/INT3, RET.
+    constexpr std::array<uint8_t, 12> guarded_assert{0xE8,0,0,0,0,0x84,0xC0,0x74,0x02,0x90,0xCC,0xC3};
+    constexpr std::array<uint8_t, 7> unguarded_trap{0xE8,0,0,0,0,0xCC,0xC3};
+    constexpr std::array<uint8_t, 6> direct_thunk{0xE9,0,0,0,0,0xC3};
+    constexpr std::array<uint8_t, 2> cycle{0xEB,0xFE};
+    constexpr std::array<uint8_t, 3> ret_with_pop{0xC2,8,0};
+    expect(validate(noop), "folded no-op is callable only at the source-verified slot");
+    expect(validate(noop_ret_zero), "Hotel188 RET 0 is equivalent to a folded no-op at the verified slot");
+    expect(!validate(std::span{noop_ret_zero}.first(1)) && !validate(std::span{noop_ret_zero}.first(2)),
+        "truncated RET imm16 cannot validate a source slot");
+    for (uint32_t immediate = 1; immediate <= UINT16_MAX; ++immediate) {
+        const std::array<uint8_t, 3> nonzero_cleanup{0xC2, static_cast<uint8_t>(immediate), static_cast<uint8_t>(immediate >> 8)};
+        expect(!validate(nonzero_cleanup), "every nonzero RET imm16 remains unsafe for the modern void ABI");
+    }
+    expect(validate(call_return), "ordinary PostInitProperties prefix remains accepted");
+    expect(validate(guarded_assert), "a conditional assertion trap does not reject the verified function");
+    expect(!validate(unguarded_trap), "unguarded INT3 still fails closed even after a call");
+    expect(validate(direct_thunk), "short direct thunks validate their target without execution");
+    expect(!validate(cycle), "self-referential thunk is rejected without unbounded traversal");
+    expect(!validate(ret_with_pop), "callee-pop returns do not validate the modern void ABI");
+    expect(!validate({}), "missing code fails closed");
+    for (size_t length = 1; length < call_return.size() - 1; ++length) {
+        expect(!validate(std::span{call_return}.first(length)), "truncated instruction fails closed");
+    }
+    auto wrong_bypass = guarded_assert;
+    wrong_bypass[8] = 1;
+    expect(!validate(wrong_bypass), "a branch to the trap itself is not an assertion bypass");
+    wrong_bypass[8] = 0x70;
+    expect(!validate(wrong_bypass), "out-of-image branch targets fail closed");
+    expect(!validate(std::span{direct_thunk}.first(5)), "unreadable thunk target is not accepted");
+    std::array<uint8_t, 31> excessive_thunks{};
+    for (size_t offset = 0; offset < 30; offset += 5) { excessive_thunks[offset] = 0xE9; }
+    excessive_thunks.back() = 0xC3;
+    expect(!validate(excessive_thunks), "thunk traversal has a hard hop limit");
+    std::array<uint8_t, 300> long_prefix{};
+    long_prefix.fill(0x90);
+    size_t reads{};
+    expect(!validate(long_prefix, &reads) && reads == 256,
+        "a body without calls/return has a hard byte budget");
+
+    // NewTrinity UE5.8.2 PDB-confirmed UObject::PostInitProperties prefix.
+    // The former linear checker rejected the guarded INT3 at +0xBC and then
+    // selected GetDetailedInfoInternal (slot 9) instead of the verified slot 10.
+    constexpr std::array<uint8_t, 280> development_prefix{
+        0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x70,0x48,0x8B,0xF9,0xE8,0xEE,0xB9,
+        0x01,0x00,0x48,0x8D,0x8C,0x24,0x80,0x00,0x00,0x00,0x48,0x8B,0xD0,0x48,0x89,0x4C,
+        0x24,0x60,0x48,0x8D,0x0D,0xB7,0x2A,0xC5,0xFF,0x48,0x89,0x4C,0x24,0x58,0x48,0x8D,
+        0x4C,0x24,0x58,0xE8,0x68,0x7C,0x3C,0xFF,0x48,0x89,0x7C,0x24,0x50,0x48,0x8B,0x88,
+        0xD8,0x00,0x00,0x00,0x48,0x8D,0x58,0x58,0x48,0x85,0xC9,0x48,0x8D,0x44,0x24,0x50,
+        0x48,0x0F,0x44,0xCB,0x48,0x3B,0xC1,0x72,0x64,0x48,0x63,0x93,0x8C,0x00,0x00,0x00,
+        0x4C,0x8D,0x44,0x24,0x50,0x48,0x8D,0x04,0xD1,0x4C,0x3B,0xC0,0x73,0x4F,0x48,0x63,
+        0x83,0x88,0x00,0x00,0x00,0x4C,0x8D,0x0D,0x54,0x27,0x2E,0x0D,0x48,0xC7,0x44,0x24,
+        0x40,0x08,0x00,0x00,0x00,0x41,0xB8,0x94,0x08,0x00,0x00,0x48,0x89,0x44,0x24,0x38,
+        0x48,0x8D,0x44,0x24,0x50,0x48,0x89,0x54,0x24,0x30,0x48,0x8D,0x15,0xBF,0x93,0x2D,
+        0x0D,0x48,0x89,0x4C,0x24,0x28,0x48,0x8D,0x0D,0x5B,0x28,0x2E,0x0D,0x48,0x89,0x44,
+        0x24,0x20,0xE8,0x29,0x64,0x4E,0xFF,0x84,0xC0,0x74,0x02,0x90,0xCC,0x8B,0x83,0x88,
+        0x00,0x00,0x00,0x4C,0x8D,0x83,0x8C,0x00,0x00,0x00,0x41,0x3B,0x00,0x75,0x0D,0xB9,
+        0x08,0x08,0x00,0x00,0x48,0x8B,0xD3,0xE8,0x64,0x39,0xFD,0xFF,0x8D,0x48,0x01,0x48,
+        0xC7,0x44,0x24,0x20,0x00,0x00,0x00,0x00,0x89,0x8B,0x88,0x00,0x00,0x00,0x41,0xB0,
+        0x01,0x48,0x8B,0x93,0x80,0x00,0x00,0x00,0x48,0x63,0xC8,0x48,0x85,0xD2,0x48,0x8B,
+        0x44,0x24,0x50,0x48,0x0F,0x44,0xD3,0x45,0x33,0xC9,0x48,0x89,0x04,0xCA,0x48,0x8B,
+        0xD7,0x48,0x8B,0x4F,0x10,0x48,0x8B,0x01};
+    expect(validate(development_prefix), "matching development-build PostInitProperties validates at its real slot");
+    using uevr::post_init::may_scan_legacy_virtuals;
+    expect(!may_scan_legacy_virtuals(true, false),
+        "a rejected modern source slot never falls back to unrelated nearby/legacy virtuals");
+    expect(!may_scan_legacy_virtuals(true, true) && !may_scan_legacy_virtuals(false, true),
+        "a validated source/legacy slot is never rescanned");
+    expect(may_scan_legacy_virtuals(false, false), "unclassified legacy layouts keep their established discovery path");
+    using uevr::post_init::relative_target;
+    expect(!relative_target(0, -1) && !relative_target((std::numeric_limits<uintptr_t>::max)(), 1),
+        "branch arithmetic rejects underflow and overflow");
+
+    constexpr std::array<uint8_t, 6> import_thunk{0xFF,0x25,0,0,0,0};
+    const auto read_import_code = [&](uintptr_t address) -> std::span<const uint8_t> {
+        if (address == 0x1000) { return import_thunk; }
+        if (address == 0x2000) { return noop; } // A different loaded module.
+        return {};
+    };
+    expect(validates_source_slot_body(0x1000, read_import_code,
+        [](uintptr_t address) -> std::optional<uintptr_t> {
+            return address == 0x1006 ? std::optional<uintptr_t>{0x2000} : std::nullopt;
+        }), "RIP-relative import thunks validate their pointer and target module");
+    expect(!validates_source_slot_body(0x1000, read_import_code),
+        "unreadable RIP-relative pointer slots fail closed");
+    expect(!validates_source_slot_body(0x1000, read_import_code,
+        [](uintptr_t) -> std::optional<uintptr_t> { return 0x3000; }),
+        "non-module/invalid import targets fail closed");
+    expect(!validates_source_slot_body(0x1000, read_import_code,
+        [](uintptr_t) -> std::optional<uintptr_t> { return 0x1000; }),
+        "indirect thunk cycles are bounded too");
+
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const auto page = static_cast<size_t>(info.dwPageSize);
+    auto* memory = static_cast<uint8_t*>(VirtualAlloc(nullptr, page * 3,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    expect(memory != nullptr, "code-window fixture allocation succeeds");
+    if (memory) {
+        constexpr std::array<uint8_t, 6> boundary_code{0xE8,0,0,0,0,0xC3};
+        memcpy(memory + page - 3, boundary_code.data(), boundary_code.size());
+        memory[page * 2 - 1] = 0xC3;
+        DWORD old{};
+        expect(VirtualProtect(memory, page, PAGE_EXECUTE_READWRITE, &old) != 0 &&
+               VirtualProtect(memory + page, page, PAGE_EXECUTE_READ, &old) != 0 &&
+               VirtualProtect(memory + page * 2, page, PAGE_NOACCESS, &old) != 0,
+            "code-window fixture protections are installed");
+        const auto base = reinterpret_cast<uintptr_t>(memory);
+        const auto reader = [&](uintptr_t address) {
+            return uevr::post_init::module_window(address, base, base + page * 3, 15, true);
+        };
+        expect(validates_source_slot_body(base + page - 3, reader),
+            "an instruction crossing readable executable regions is accepted");
+        expect(validates_source_slot_body(base + page * 2 - 1, reader),
+            "a complete return at the no-access boundary is accepted");
+        expect(!validates_source_slot_body(base + page * 2, reader),
+            "no-access code is rejected without dereferencing it");
+        expect(uevr::post_init::module_window(base + page * 2 - 1, base, base + page * 2, 15, true).size() == 1,
+            "code windows never exceed loaded-image bounds");
+        expect(VirtualProtect(memory + page, page, PAGE_READONLY, &old) != 0,
+            "data-only protection is installed");
+        expect(reader(base + page).empty() &&
+               uevr::post_init::module_window(base + page, base, base + page * 3, sizeof(uintptr_t), false).size() == sizeof(uintptr_t),
+            "readable data is allowed only for pointer slots, never as callable code");
+        expect(VirtualProtect(memory + page, page, PAGE_EXECUTE_READ | PAGE_GUARD, &old) != 0 &&
+               reader(base + page).empty(), "guarded executable pages are never read");
+        VirtualFree(memory, 0, MEM_RELEASE);
+    }
+}
+
+class CountingSink final : public spdlog::sinks::base_sink<std::mutex> {
+public:
+    std::atomic<int> count{};
+private:
+    void sink_it_(const spdlog::details::log_msg&) override { ++count; }
+    void flush_() override {}
+};
+
+void concurrent_sites(std::atomic<int>& arguments) {
+    SPDLOG_INFO_ONCE("info {}", ++arguments);
+    SPDLOG_WARN_ONCE("warn {}", ++arguments);
+    SPDLOG_ERROR_ONCE("error {}", ++arguments);
+}
+
+void runtime_disabled_site(int& arguments) { SPDLOG_INFO_ONCE("{}", ++arguments); }
+
+void test_opaque_states() {
+    utility::OpaqueStateRegistry<int, uintptr_t> registry;
+    auto first = std::make_shared<int>(42);
+    const auto handle = registry.publish(first, 123);
+    expect(handle && registry.publish(first,123) == handle, "repeated queries preserve public handle identity");
+    expect(registry.resolve(handle).first == first, "registered handle resolves payload");
+    expect(!registry.resolve(reinterpret_cast<void*>(UINTPTR_MAX)).first, "arbitrary plugin handle is never dereferenced");
+    const auto second_owner = registry.publish(first,124);
+    expect(second_owner != handle, "different owner has a separate handle");
+    first.reset();
+    expect(!registry.resolve(handle).first && !registry.resolve(second_owner).first, "retired payload is not retained by plugin handles");
+    std::vector<std::jthread> workers;
+    for (int n=0;n<8;++n) {
+        workers.emplace_back([&, n] {
+            auto state = std::make_shared<int>(n);
+            for (int i=0;i<1000;++i) { auto h=registry.publish(state,123); if (registry.resolve(h).first != state) { std::terminate(); } }
+        });
+    }
+    workers.clear();
+    auto replacement = std::make_shared<int>(99);
+    expect(registry.publish(replacement,123) != handle && !registry.resolve(handle).first,
+        "stale handles never resolve a replacement payload");
+}
+
+void test_logging() {
+    const auto previous = spdlog::default_logger();
+    const auto sink = std::make_shared<CountingSink>();
+    const auto logger = std::make_shared<spdlog::logger>("diagnostic-test", sink);
+    logger->set_level(spdlog::level::trace);
+    spdlog::set_default_logger(logger);
+    std::atomic<int> arguments{};
+    std::barrier start{16};
+    std::vector<std::jthread> workers;
+    for (int i = 0; i < 16; ++i) {
+        workers.emplace_back([&] {
+            start.arrive_and_wait();
+            for (int n = 0; n < 1000; ++n) { concurrent_sites(arguments); }
+        });
+    }
+    workers.clear();
+    expect(sink->count == 3, "concurrent once sites each emit exactly once");
+    expect(arguments == 3, "once arguments are evaluated only by winning callers");
+    int disabled_arguments{};
+    logger->set_level(spdlog::level::off);
+    runtime_disabled_site(disabled_arguments);
+    logger->set_level(spdlog::level::trace);
+    runtime_disabled_site(disabled_arguments);
+    expect(sink->count == 3 && disabled_arguments == 1, "runtime filtering retains original once semantics");
+    expect(disabled_log_argument_evaluations() == 0, "compiled-out log arguments are not evaluated");
+    spdlog::set_default_logger(previous);
+}
+
+void test_readbacks() {
+    using namespace uevr::cvar_diagnostics;
+    WriteObservation rejected;
+    auto id = rejected.begin(0, false);
+    expect(rejected.state == WriteState::queued && !rejected.pending, "queued setter is not accepted/observed");
+    expect(rejected.dispatched(id, true, 1000), "void setter completion starts readback only");
+    expect(!rejected.observe(id, 0, 1099), "readbacks do not busy poll before their interval");
+    for (int i = 1; i <= 4; ++i) { rejected.observe(id, 1, 1000 + i * 100); }
+    expect(rejected.state == WriteState::not_observed && !rejected.pending, "ignored write is not reported as applied");
+    expect(!rejected.observe(id, 0, 2000) && rejected.samples == 4, "readback stops at the bounded sample limit");
+
+    WriteObservation delayed;
+    id = delayed.begin(0, false);
+    delayed.dispatched(id, true, 0);
+    delayed.observe(id, 1, 100);
+    delayed.observe(id, 1, 200);
+    delayed.observe(id, 0, 300);
+    delayed.observe(id, 0, 400);
+    expect(delayed.state == WriteState::observed && delayed.actual == 0, "delayed application and real zero are observed");
+
+    WriteObservation overwritten;
+    id = overwritten.begin(0, false);
+    overwritten.dispatched(id, true, 0);
+    overwritten.observe(id, 0, 100);
+    for (int i = 2; i <= 4; ++i) { overwritten.observe(id, 1, i * 100); }
+    expect(overwritten.state == WriteState::changed_after_observed, "later game overwrite is distinct from never observed");
+
+    WriteObservation failed;
+    id = failed.begin(0, false);
+    failed.dispatched(id, false, 0);
+    expect(failed.state == WriteState::setter_unavailable && !failed.pending, "unavailable setter does not schedule getters");
+    id = failed.begin(0, false);
+    failed.dispatched(id, true, 0);
+    for (int i = 1; i <= 4; ++i) { failed.observe(id, std::nullopt, i * 100); }
+    expect(failed.state == WriteState::readback_unavailable && !failed.actual, "failed getter is not mistaken for zero");
+    expect(to_json(failed)["actual"].is_null(), "unavailable value exports as null");
+
+    WriteObservation latest;
+    const auto old = latest.begin(1, false);
+    const auto current = latest.begin(2, false);
+    expect(!latest.dispatched(old, true, 0), "superseded setter cannot update latest diagnostics");
+    latest.dispatched(current, true, 0);
+    expect(!latest.observe(old, 1, 100), "superseded readback is discarded");
+    latest.observe(current, 2, 100);
+    expect(!latest.dispatched(current, true, 100), "duplicate completion cannot restart sampling");
+    expect(latest.requested == 2 && latest.actual == 2, "latest request retains its own readback");
+
+    for (const auto requested : {1, 2, 4, 8, 16}) {
+        WriteObservation anisotropy;
+        id = anisotropy.begin(requested, false);
+        anisotropy.dispatched(id, true, 0);
+        const auto previous = requested == 8 ? 4 : 8;
+        anisotropy.observe(id, previous, 100);
+        expect(anisotropy.state != WriteState::observed && anisotropy.actual == previous,
+            "anisotropy readback must not equate different nonzero integer values");
+        for (int i = 2; i <= 4; ++i) { anisotropy.observe(id, requested, i * 100); }
+        expect(anisotropy.state == WriteState::observed && anisotropy.actual == requested && !anisotropy.pending,
+            "anisotropy presets report the applied integer value and stop bounded readback polling");
+    }
+
+    WriteObservation floating;
+    id = floating.begin(0.3, true);
+    floating.dispatched(id, true, 0);
+    floating.observe(id, static_cast<double>(0.3f), 100);
+    expect(floating.state == WriteState::observed, "float conversion noise is tolerated");
+    for (int i = 2; i <= 4; ++i) { floating.observe(id, std::numeric_limits<double>::quiet_NaN(), i * 100); }
+    expect(floating.state == WriteState::readback_unavailable && !floating.actual, "nonfinite getter is unavailable");
+}
+
+void test_support_report() {
+    using namespace utility::support;
+    const auto build = build_identity("uevr-sha", "sdk-sha", "true", "false", "branch", "date", "time");
+    expect(build["uesdk_commit"] == "sdk-sha" && build["uevr_tracked_changes"] == "true", "report identifies SDK and local changes");
+    const auto capped = pacing(11111111, 75);
+    expect(capped["positive_cap_below_refresh"] == true && capped["automatic_adjustment"] == false, "75/90 pacing is descriptive, never auto-corrected");
+    expect(pacing(11111111, 0)["positive_cap_below_refresh"] == false, "uncapped is not treated as zero FPS");
+    expect(pacing(0, 75)["headset_refresh_hz"].is_null(), "unknown refresh is not invented");
+    expect(pacing(11111111, std::nullopt)["frame_cap_fps"].is_null(), "unknown cap is not guessed");
+    expect(pacing(11111111, std::numeric_limits<double>::infinity())["frame_cap_fps"].is_null(), "invalid cap is unavailable");
+}
+
+void test_gpu_retirement() {
+    using utility::gpu::references_retired;
+    unsigned reads{};
+    uint64_t completed{};
+    const auto read_completed = [&] { ++reads; return completed; };
+    expect(references_retired(false,false,false,false,0,read_completed), "unused command context has no GPU references");
+    expect(references_retired(false,false,false,true,4,read_completed), "already reclaimed commands need no GPU query");
+    expect(!references_retired(true,false,false,true,4,read_completed), "unsubmitted recorded commands retain resources");
+    expect(!references_retired(false,true,true,true,4,read_completed), "poisoned submission cannot prove retirement");
+    expect(!references_retired(false,true,false,false,4,read_completed), "missing fence retains old resources");
+    expect(!references_retired(false,true,false,true,0,read_completed), "unproven signal value retains old resources");
+    expect(reads == 0, "unsubmitted or invalid contexts never query a GPU fence");
+    completed=3;
+    expect(!references_retired(false,true,false,true,4,read_completed), "in-flight copy retains resource and descriptors");
+    completed=4;
+    expect(references_retired(false,true,false,true,4,read_completed), "matching completion permits replacement");
+    completed=5;
+    expect(references_retired(false,true,false,true,4,read_completed), "later completion also retires the old reference");
+    expect(!references_retired(false,true,false,true,6,read_completed), "a new submission requires its own completed fence");
+    completed=(std::numeric_limits<uint64_t>::max)();
+    expect(!references_retired(false,true,false,true,4,read_completed), "device removal is not successful GPU retirement");
+
+    struct Consumer { bool recorded{},submitted{},poisoned{}; uint64_t signal{},completed{}; };
+    std::array<Consumer,4> consumers{{{}, {false,true,false,2,2}, {false,true,false,3,2}, {}}};
+    const auto all_retired = [&] {
+        for (auto& c : consumers) {
+            if (!references_retired(c.recorded,c.submitted,c.poisoned,c.submitted,c.signal,[&] { return c.completed; })) { return false; }
+        }
+        return true;
+    };
+    expect(!all_retired(), "one busy consumer prevents replacement even after another completes");
+    consumers[2].completed=3;
+    expect(all_retired(), "retry accepts completion without changing any submission state");
+    expect(consumers[1].submitted && consumers[2].submitted, "retirement observation does not reset command contexts");
+    consumers[3].recorded=true;
+    expect(!all_retired(), "recorded but unsubmitted consumer also blocks replacement");
+}
+
+void test_bounded_texture_diagnostics() {
+    using namespace utility::diagnostics;
+    BoundedTextureObservations<> observations;
+    std::atomic_bool enabled{false};
+    int queries = 0;
+    const auto key_provider = [&]() { ++queries; return uintptr_t{0x1000}; };
+    for (int i = 0; i < 1000; ++i) {
+        expect(!observations.observe(enabled.load(std::memory_order_acquire), key_provider),
+            "disabled texture diagnostics produce no observations");
+    }
+    expect(queries == 0, "disabled diagnostics never query native resources");
+
+    enabled.store(true, std::memory_order_release);
+    const auto first = observations.observe(enabled.load(std::memory_order_acquire), key_provider);
+    expect(queries == 1 && first && first->first_seen && first->seen == 1 && first->tracked_keys == 1,
+        "opt-in diagnostics start with an untouched budget");
+    const auto duplicate = observations.observe(true, key_provider);
+    expect(duplicate && !duplicate->first_seen && duplicate->duplicate_suppressed == 1,
+        "repeated resources are not logged as new allocations");
+
+    TextureObservation last{};
+    size_t detailed = 1;
+    for (uintptr_t key = 0x1001; key < 0x1001 + 10000; ++key) {
+        last = *observations.observe(true, [key]() { return key; });
+        detailed += last.first_seen ? 1 : 0;
+    }
+    expect(detailed == 64 && last.tracked_keys == 64 && last.overflow_suppressed == 10000 - 63,
+        "texture identity churn has fixed storage and at most 64 detailed entries");
+    expect(last.seen == last.tracked_keys + last.duplicate_suppressed + last.overflow_suppressed,
+        "overflow counts observations without claiming exact uniqueness");
+    enabled.store(false, std::memory_order_release);
+    expect(!observations.observe(enabled.load(std::memory_order_acquire), key_provider) && queries == 2,
+        "disabling a running recorder stops native queries immediately on subsequent calls");
+    const auto resumed = observations.observe(true, key_provider);
+    expect(resumed && !resumed->first_seen && resumed->seen == last.seen + 1 && resumed->tracked_keys == 64,
+        "toggle does not reset the per-injection tracking bound");
+
+    BoundedTextureObservations<> reentrant;
+    const auto outer = reentrant.observe(true, [&]() {
+        reentrant.observe(true, []() { return uintptr_t{1}; });
+        return uintptr_t{2};
+    });
+    expect(outer && outer->seen == 2, "resource providers execute outside the diagnostic mutex");
+
+    BoundedTextureObservations<> concurrent;
+    std::atomic<int> first_seen{0};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&]() {
+            for (int i = 0; i < 1000; ++i) {
+                const auto sample = concurrent.observe(true, [i]() { return uintptr_t(i % 128); });
+                if (sample->first_seen) { ++first_seen; }
+            }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    const auto total = concurrent.observe(true, []() { return uintptr_t{0}; });
+    expect(total && first_seen == 64 && total->tracked_keys == 64 && total->seen == 8001,
+        "concurrent texture observations publish coherent bounded counters");
+    expect(total && total->seen == total->tracked_keys + total->duplicate_suppressed + total->overflow_suppressed,
+        "concurrent observation accounting loses no samples");
+
+    using namespace std::chrono_literals;
+    TextureProbeBudget<3> probes;
+    const auto start = TextureProbeBudget<3>::Clock::time_point{};
+    expect(!probes.try_acquire(false, start), "disabled viewport probing consumes no budget");
+    expect(probes.try_acquire(true, start), "first enabled viewport probe is admitted");
+    expect(!probes.try_acquire(true, start - 1s) && !probes.try_acquire(true, start + 1999ms),
+        "viewport probes neither run backwards in time nor exceed their rate limit");
+    expect(!probes.try_acquire(false, start + 2s) && probes.try_acquire(true, start + 2s),
+        "disabled probe attempts do not advance cadence or consume a sample");
+    expect(probes.try_acquire(true, start + 4s) && !probes.try_acquire(true, start + 100s),
+        "viewport probe budget remains bounded for the injection session");
+
+    TextureProbeBudget<> concurrent_probes;
+    std::atomic<int> admitted{0};
+    workers.clear();
+    std::barrier ready{8};
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&]() {
+            ready.arrive_and_wait();
+            if (concurrent_probes.try_acquire(true, start)) { ++admitted; }
+        });
+    }
+    for (auto& worker : workers) { worker.join(); }
+    expect(admitted == 1, "concurrent viewport callbacks share one probe cadence");
+}
+
+void test_uobject_metadata_filter() {
+    struct ClassToken {};
+    ClassToken child{};
+    ClassToken parent{};
+    ClassToken missing{};
+    const auto poisoned = reinterpret_cast<ClassToken*>((std::numeric_limits<uintptr_t>::max)());
+
+    const std::wstring child_name = L"Class /Game/BP_Child.BP_Child_C";
+    const std::wstring parent_name = L"Class /Script/Engine.Actor";
+    const std::vector<ClassToken*> chain{&child, poisoned, &missing, &parent};
+    size_t lookups{};
+
+    const auto lookup = [&](ClassToken* pointer) -> const std::wstring* {
+        ++lookups;
+        if (pointer == &child) { return &child_name; }
+        if (pointer == &parent) { return &parent_name; }
+        return nullptr;
+    };
+
+    using utility::uobject::cached_class_chain_matches;
+    expect(cached_class_chain_matches(child_name, chain, L"BP_Child", lookup),
+        "UObject class filtering matches cached direct names");
+    lookups = 0;
+    expect(cached_class_chain_matches(child_name, chain, L"Engine.Actor", lookup) && lookups == 4,
+        "UObject class filtering reaches cached parents without dereferencing opaque pointers");
+    lookups = 0;
+    expect(!cached_class_chain_matches(child_name, chain, L"NotPresent", lookup) && lookups == 4,
+        "missing and poisoned cached class keys fail closed");
+    expect(!cached_class_chain_matches(child_name, chain, L"Engine.Actor", lookup, 2),
+        "UObject class filtering obeys its traversal bound");
+    expect(cached_class_chain_matches(child_name, chain, L"", lookup, 0),
+        "empty UObject class filters preserve the unfiltered list");
+
+    using RecentObject = utility::uobject::CachedRecentObject<ClassToken>;
+    const RecentObject recent{poisoned, L"Object /Game/Cached", 17, 29, true};
+    size_t identity_checks{};
+    const auto validate_identity = [&](ClassToken* pointer, int32_t index, int32_t serial) {
+        ++identity_checks;
+        return pointer == poisoned && index == 17 && serial == 29;
+    };
+
+    expect(utility::uobject::cached_recent_object_is_current(recent, true, validate_identity) && identity_checks == 1,
+        "recent UObject validation treats cached pointers as opaque identity tokens");
+    identity_checks = 0;
+    expect(!utility::uobject::cached_recent_object_is_current(recent, false, validate_identity) && identity_checks == 0,
+        "untracked recent UObjects fail closed without consulting game memory");
+    identity_checks = 0;
+    auto missing_identity = recent;
+    missing_identity.identity_valid = false;
+    expect(!utility::uobject::cached_recent_object_is_current(missing_identity, true, validate_identity) && identity_checks == 0,
+        "recent UObjects without a cached FUObjectArray identity fail closed");
+}
+
+void test_uobject_allocator_discovery() {
+    using utility::uobject::browser_element;
+    expect(browser_element(0x10000, 3, 4, 8, 2) == 0x10010, "object array stride remains pointer-sized");
+    expect(browser_element(0x10000, 3, 4, 16, 2) == 0x10020, "interface arrays skip native interface pointers");
+    expect(!browser_element(0x10000, -1, 4, 8, 0) && !browser_element(0x10000, 5, 4, 8, 0) &&
+        !browser_element(0x10000, 3, 4, 8, 3), "browser rejects invalid counts before reading elements");
+    expect(!browser_element(UINTPTR_MAX - 3, 1, 1, 8, 0) && !browser_element(0x10000, 3, 4, SIZE_MAX, 0),
+        "browser rejects element range overflow");
+    using uevr::uobject::discovery::AllocatorEvidence;
+    using uevr::uobject::discovery::validates_allocator_evidence;
+
+    AllocatorEvidence evidence{
+        0x140000000, 0x0a978000, 0x1411bbda4, 0x1411bc083,
+        {0x1411bbf93, 0x1411bbe15, 0x1411bbf08}, 13, 2, true, true};
+    expect(validates_allocator_evidence(evidence),
+        "independent diagnostics and GUObjectArray references identify the shared allocator");
+    evidence.diagnostic_references[1] = evidence.function_end;
+    expect(!validates_allocator_evidence(evidence), "a diagnostic outside the unwind function fails closed");
+    evidence.diagnostic_references[1] = 0x1411bbe15;
+    evidence.object_array_references = 2;
+    expect(!validates_allocator_evidence(evidence), "insufficient object-array references fail closed");
+    evidence.object_array_references = 13;
+    evidence.direct_callers = 0;
+    expect(!validates_allocator_evidence(evidence), "an uncalled function fails closed");
+    evidence.direct_callers = 2;
+    evidence.unwind_matches = false;
+    expect(!validates_allocator_evidence(evidence), "unmatched unwind metadata fails closed");
+    evidence.unwind_matches = true;
+    evidence.function_end = evidence.image_base + evidence.image_size + 1;
+    expect(!validates_allocator_evidence(evidence), "out-of-image allocator fails closed");
+
+    std::array<uint8_t, 30> free_stores{
+        0x48,0xC7,0x43,0x08,0,0,0,0, 0x48,0xC7,0x43,0x10,0,0,0,0,
+        0x48,0xC7,0x03,0,0,0,0, 0xC7,0x46,0x0C,0xFF,0xFF,0xFF,0xFF};
+    using uevr::uobject::discovery::validates_townfall_free_stores;
+    expect(validates_townfall_free_stores(free_stores), "Townfall inlined GC invalidation has a complete item/index contract");
+    free_stores[24] = 0x45;
+    expect(validates_townfall_free_stores(free_stores), "Townfall standalone free path has the same item contract");
+    for (size_t i = 0; i < free_stores.size(); ++i) {
+        auto changed = free_stores;
+        changed[i] ^= 0x80;
+        expect(!validates_townfall_free_stores(changed), "changed free-store instructions fail closed");
+        expect(!validates_townfall_free_stores(std::span{free_stores}.first(i)), "truncated free-store contract fails closed");
+    }
+}
+}
+
+int main() {
+    test_scene_capture_lifecycle();
+    test_source_post_init_validation();
+    test_opaque_states();
+    test_logging();
+    test_readbacks();
+    test_support_report();
+    test_gpu_retirement();
+    test_bounded_texture_diagnostics();
+    test_uobject_metadata_filter();
+    test_uobject_allocator_discovery();
+    failures += test_cached_cvar_reads();
+    failures += test_console_text();
+    failures += test_discovery_validation();
+    failures += test_cadence_replay();
+    failures += test_ue58_ui_initialization();
+    failures += test_ktjl_openxr_factory();
+    failures += test_uobject_browser_cost();
+    failures += test_buffered_rt_texture_call();
+    if (failures != 0) { return 1; }
+    std::cout << "Diagnostic safety tests passed\n";
+    return 0;
+}

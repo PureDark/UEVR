@@ -59,6 +59,11 @@ endif()
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+option(UEVR_BUILD_COMPATIBILITY_TESTS "Build the offline compatibility policy tests" OFF)
+if(UEVR_BUILD_COMPATIBILITY_TESTS)
+    enable_testing()
+endif()
+
 # UESDK is a PRIVATE submodule (praydog's SDK) so it can't be forked publicly to
 # carry the embedded-RenderDoc crash fix. Apply it to the builder's own checkout
 # before UESDK is added/compiled. Idempotent; warns (never fails) on drift.
@@ -95,6 +100,8 @@ FetchContent_Declare(kananlib
 		49fdf2d3b1db350e370beacb607d5721bc2911ad
 )
 FetchContent_MakeAvailable(kananlib)
+
+include(cmake/KananlibDecodeWindow.cmake)
 
 message(STATUS "Fetching sdkgenny (f58077f8da8a271490c17558e93b75843b3afd19)...")
 FetchContent_Declare(sdkgenny
@@ -499,6 +506,646 @@ target_link_libraries(sdk-test PUBLIC
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target compatibility-policy-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET compatibility-policy-tests)
+	set(compatibility-policy-tests_SOURCES "")
+
+	list(APPEND compatibility-policy-tests_SOURCES
+		"tests/CompatibilityPolicyTests.cpp"
+	)
+
+	list(APPEND compatibility-policy-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${compatibility-policy-tests_SOURCES})
+	add_executable(compatibility-policy-tests)
+
+	if(compatibility-policy-tests_SOURCES)
+		target_sources(compatibility-policy-tests PRIVATE ${compatibility-policy-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT compatibility-policy-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${compatibility-policy-tests_SOURCES})
+
+	target_compile_features(compatibility-policy-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(compatibility-policy-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+		"dependencies/submodules/glm"
+	)
+
+	target_link_libraries(compatibility-policy-tests PRIVATE
+		nlohmann_json
+		bddisasm
+	)
+
+	add_test(NAME compatibility-policy-tests COMMAND compatibility-policy-tests)
+	add_test(NAME build-metadata-tests COMMAND powershell -NoProfile -NonInteractive
+	    -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/BuildMetadataTests.ps1")
+	set_tests_properties(build-metadata-tests PROPERTIES TIMEOUT 120)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target steam-frame-input-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET steam-frame-input-tests)
+	set(steam-frame-input-tests_SOURCES "")
+
+	list(APPEND steam-frame-input-tests_SOURCES
+		"tests/SteamFrameInputTests.cpp"
+	)
+
+	list(APPEND steam-frame-input-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${steam-frame-input-tests_SOURCES})
+	add_executable(steam-frame-input-tests)
+
+	if(steam-frame-input-tests_SOURCES)
+		target_sources(steam-frame-input-tests PRIVATE ${steam-frame-input-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT steam-frame-input-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${steam-frame-input-tests_SOURCES})
+
+	target_compile_features(steam-frame-input-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(steam-frame-input-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(steam-frame-input-tests PRIVATE
+		nlohmann_json
+	)
+
+	add_test(NAME steam-frame-input-tests COMMAND steam-frame-input-tests "${CMAKE_CURRENT_SOURCE_DIR}")
+	set_tests_properties(steam-frame-input-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target stock-frame-migration-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET stock-frame-migration-tests)
+	set(stock-frame-migration-tests_SOURCES "")
+
+	list(APPEND stock-frame-migration-tests_SOURCES
+		"tests/StockFrameMigrationTests.cpp"
+	)
+
+	list(APPEND stock-frame-migration-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${stock-frame-migration-tests_SOURCES})
+	add_executable(stock-frame-migration-tests)
+
+	if(stock-frame-migration-tests_SOURCES)
+		target_sources(stock-frame-migration-tests PRIVATE ${stock-frame-migration-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT stock-frame-migration-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${stock-frame-migration-tests_SOURCES})
+
+	target_compile_features(stock-frame-migration-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(stock-frame-migration-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(stock-frame-migration-tests PRIVATE
+		nlohmann_json
+	)
+
+	add_test(NAME stock-frame-migration-tests COMMAND stock-frame-migration-tests)
+	set_tests_properties(stock-frame-migration-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target gamepad-recovery-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET gamepad-recovery-tests)
+	set(gamepad-recovery-tests_SOURCES "")
+
+	list(APPEND gamepad-recovery-tests_SOURCES
+		"tests/GamepadRecoveryTests.cpp"
+	)
+
+	list(APPEND gamepad-recovery-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${gamepad-recovery-tests_SOURCES})
+	add_executable(gamepad-recovery-tests)
+
+	if(gamepad-recovery-tests_SOURCES)
+		target_sources(gamepad-recovery-tests PRIVATE ${gamepad-recovery-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT gamepad-recovery-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${gamepad-recovery-tests_SOURCES})
+
+	target_compile_features(gamepad-recovery-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(gamepad-recovery-tests PRIVATE
+		"src/"
+	)
+
+	add_test(NAME gamepad-recovery-tests COMMAND gamepad-recovery-tests "${CMAKE_CURRENT_SOURCE_DIR}")
+	set_tests_properties(gamepad-recovery-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target diagnostic-safety-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET diagnostic-safety-tests)
+	set(diagnostic-safety-tests_SOURCES "")
+
+	list(APPEND diagnostic-safety-tests_SOURCES
+		"tests/DiagnosticSafetyTests.cpp"
+		"tests/BufferedRTTextureCallTests.cpp"
+		"tests/UObjectBrowserCostTests.cpp"
+		"tests/CadenceReplayTests.cpp"
+		"tests/LoggingDisabledTests.cpp"
+		"tests/CachedCVarReadTests.cpp"
+		"tests/ConsoleTextTests.cpp"
+		"tests/UE58UIInitializationTests.cpp"
+		"tests/KtjLOpenXRFactoryTests.cpp"
+		"src/mods/vr/KtjLOpenXRFactory.cpp"
+		"dependencies/submodules/UESDK/tests/DiscoveryValidationTests.cpp"
+		"dependencies/submodules/UESDK/tests/LayoutSafetyTests.cpp"
+	)
+
+	list(APPEND diagnostic-safety-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${diagnostic-safety-tests_SOURCES})
+	add_executable(diagnostic-safety-tests)
+
+	if(diagnostic-safety-tests_SOURCES)
+		target_sources(diagnostic-safety-tests PRIVATE ${diagnostic-safety-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT diagnostic-safety-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${diagnostic-safety-tests_SOURCES})
+
+	target_compile_features(diagnostic-safety-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(diagnostic-safety-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+	)
+
+	target_link_libraries(diagnostic-safety-tests PRIVATE
+		nlohmann_json
+		spdlog
+		uesdk
+		Version
+		imgui
+	)
+
+	add_test(NAME diagnostic-safety-tests COMMAND diagnostic-safety-tests)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target kananlib-decode-window-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET kananlib-decode-window-tests)
+	set(kananlib-decode-window-tests_SOURCES "")
+
+	list(APPEND kananlib-decode-window-tests_SOURCES
+		"tests/KananlibDecodeWindowTests.cpp"
+	)
+
+	list(APPEND kananlib-decode-window-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${kananlib-decode-window-tests_SOURCES})
+	add_executable(kananlib-decode-window-tests)
+
+	if(kananlib-decode-window-tests_SOURCES)
+		target_sources(kananlib-decode-window-tests PRIVATE ${kananlib-decode-window-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT kananlib-decode-window-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${kananlib-decode-window-tests_SOURCES})
+
+	target_compile_features(kananlib-decode-window-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_compile_options(kananlib-decode-window-tests PRIVATE
+		"/EHa"
+	)
+
+	target_link_libraries(kananlib-decode-window-tests PRIVATE
+		kananlib
+	)
+
+	add_test(NAME kananlib-decode-window-tests COMMAND kananlib-decode-window-tests)
+	set_tests_properties(kananlib-decode-window-tests PROPERTIES TIMEOUT 60)
+	add_test(NAME kananlib-decode-window-configuration-tests COMMAND "${CMAKE_COMMAND}"
+	    "-DUEVR_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+	    "-DKANANLIB_SOURCE_DIR=${kananlib_SOURCE_DIR}"
+	    "-DUEVR_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/kananlib-decode-window/configuration-fixture"
+	    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/KananlibBackportConfigurationTests.cmake")
+	set_tests_properties(kananlib-decode-window-configuration-tests PROPERTIES TIMEOUT 120)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target hifi-hook-memory-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET hifi-hook-memory-tests)
+	set(hifi-hook-memory-tests_SOURCES "")
+
+	list(APPEND hifi-hook-memory-tests_SOURCES
+		"tests/HiFiRushHookMemoryTests.cpp"
+		"tests/GearsEDayHookTests.cpp"
+		"tests/KtjLCloudHookTests.cpp"
+		"tests/KtjLShadowGatherTests.cpp"
+		"tests/KtjLCloudOutputTests.cpp"
+		"tests/KtjLLightingThreadTests.cpp"
+		"tests/KtjLMeshResourceTests.cpp"
+		"src/utility/HiFiRushHookMemory.cpp"
+	)
+
+	list(APPEND hifi-hook-memory-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${hifi-hook-memory-tests_SOURCES})
+	add_executable(hifi-hook-memory-tests)
+
+	if(hifi-hook-memory-tests_SOURCES)
+		target_sources(hifi-hook-memory-tests PRIVATE ${hifi-hook-memory-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT hifi-hook-memory-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${hifi-hook-memory-tests_SOURCES})
+
+	target_compile_features(hifi-hook-memory-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(hifi-hook-memory-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+	)
+
+	target_link_libraries(hifi-hook-memory-tests PRIVATE
+		safetyhook
+		spdlog
+		kananlib
+	)
+
+	add_test(NAME hifi-hook-memory-tests COMMAND hifi-hook-memory-tests)
+	set_tests_properties(hifi-hook-memory-tests PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target gears-eday-aim-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET gears-eday-aim-tests)
+	set(gears-eday-aim-tests_SOURCES "")
+
+	list(APPEND gears-eday-aim-tests_SOURCES
+		"tests/GearsEDayAimTests.cpp"
+	)
+
+	list(APPEND gears-eday-aim-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${gears-eday-aim-tests_SOURCES})
+	add_executable(gears-eday-aim-tests)
+
+	if(gears-eday-aim-tests_SOURCES)
+		target_sources(gears-eday-aim-tests PRIVATE ${gears-eday-aim-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT gears-eday-aim-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${gears-eday-aim-tests_SOURCES})
+
+	target_compile_features(gears-eday-aim-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(gears-eday-aim-tests PRIVATE
+		"src/"
+		"dependencies/submodules/UESDK/src"
+	)
+
+	target_link_libraries(gears-eday-aim-tests PRIVATE
+		bddisasm
+	)
+
+	add_test(NAME gears-eday-aim-tests COMMAND gears-eday-aim-tests)
+	set_tests_properties(gears-eday-aim-tests PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target nascar-hook-compatibility-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET nascar-hook-compatibility-tests)
+	set(nascar-hook-compatibility-tests_SOURCES "")
+
+	list(APPEND nascar-hook-compatibility-tests_SOURCES
+		"tests/Nascar26HookCompatibilityTests.cpp"
+		"tests/Nascar25HookCompatibilityTests.cpp"
+		"src/utility/Nascar26HookCompatibility.cpp"
+		"src/utility/Nascar25HookCompatibility.cpp"
+	)
+
+	list(APPEND nascar-hook-compatibility-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${nascar-hook-compatibility-tests_SOURCES})
+	add_executable(nascar-hook-compatibility-tests)
+
+	if(nascar-hook-compatibility-tests_SOURCES)
+		target_sources(nascar-hook-compatibility-tests PRIVATE ${nascar-hook-compatibility-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT nascar-hook-compatibility-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${nascar-hook-compatibility-tests_SOURCES})
+
+	target_compile_features(nascar-hook-compatibility-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(nascar-hook-compatibility-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(nascar-hook-compatibility-tests PRIVATE
+		safetyhook
+		spdlog
+		kananlib
+		bcrypt
+		Version
+	)
+
+	add_test(NAME nascar-hook-compatibility-tests COMMAND nascar-hook-compatibility-tests)
+	set_tests_properties(nascar-hook-compatibility-tests PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target input-hook-installation-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET input-hook-installation-tests)
+	set(input-hook-installation-tests_SOURCES "")
+
+	list(APPEND input-hook-installation-tests_SOURCES
+		"tests/InputHookInstallationTests.cpp"
+	)
+
+	list(APPEND input-hook-installation-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${input-hook-installation-tests_SOURCES})
+	add_executable(input-hook-installation-tests)
+
+	if(input-hook-installation-tests_SOURCES)
+		target_sources(input-hook-installation-tests PRIVATE ${input-hook-installation-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT input-hook-installation-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${input-hook-installation-tests_SOURCES})
+
+	target_compile_features(input-hook-installation-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(input-hook-installation-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(input-hook-installation-tests PRIVATE
+		safetyhook
+	)
+
+	add_test(NAME input-hook-installation-tests COMMAND input-hook-installation-tests)
+	set_tests_properties(input-hook-installation-tests PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target stalker2-native-policy-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET stalker2-native-policy-tests)
+	set(stalker2-native-policy-tests_SOURCES "")
+
+	list(APPEND stalker2-native-policy-tests_SOURCES
+		"tests/Stalker2NativePolicyTests.cpp"
+	)
+
+	list(APPEND stalker2-native-policy-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${stalker2-native-policy-tests_SOURCES})
+	add_executable(stalker2-native-policy-tests)
+
+	if(stalker2-native-policy-tests_SOURCES)
+		target_sources(stalker2-native-policy-tests PRIVATE ${stalker2-native-policy-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT stalker2-native-policy-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${stalker2-native-policy-tests_SOURCES})
+
+	target_compile_features(stalker2-native-policy-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(stalker2-native-policy-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(stalker2-native-policy-tests PRIVATE
+		nlohmann_json
+	)
+
+	add_test(NAME stalker2-native-policy-tests COMMAND stalker2-native-policy-tests)
+	set_tests_properties(stalker2-native-policy-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target stalker2-native-d3d12-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET stalker2-native-d3d12-tests)
+	set(stalker2-native-d3d12-tests_SOURCES "")
+
+	list(APPEND stalker2-native-d3d12-tests_SOURCES
+		"tests/Stalker2NativeD3D12Tests.cpp"
+	)
+
+	list(APPEND stalker2-native-d3d12-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${stalker2-native-d3d12-tests_SOURCES})
+	add_executable(stalker2-native-d3d12-tests)
+
+	if(stalker2-native-d3d12-tests_SOURCES)
+		target_sources(stalker2-native-d3d12-tests PRIVATE ${stalker2-native-d3d12-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT stalker2-native-d3d12-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${stalker2-native-d3d12-tests_SOURCES})
+
+	target_compile_features(stalker2-native-d3d12-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(stalker2-native-d3d12-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(stalker2-native-d3d12-tests PRIVATE
+		d3d12
+		dxgi
+		openxr_loader
+	)
+
+	add_test(NAME stalker2-native-d3d12-tests COMMAND stalker2-native-d3d12-tests)
+	set_tests_properties(stalker2-native-d3d12-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target galactic-racer-letterboxing-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET galactic-racer-letterboxing-tests)
+	set(galactic-racer-letterboxing-tests_SOURCES "")
+
+	list(APPEND galactic-racer-letterboxing-tests_SOURCES
+		"tests/GalacticRacerLetterboxingTests.cpp"
+	)
+
+	list(APPEND galactic-racer-letterboxing-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${galactic-racer-letterboxing-tests_SOURCES})
+	add_executable(galactic-racer-letterboxing-tests)
+
+	if(galactic-racer-letterboxing-tests_SOURCES)
+		target_sources(galactic-racer-letterboxing-tests PRIVATE ${galactic-racer-letterboxing-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT galactic-racer-letterboxing-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${galactic-racer-letterboxing-tests_SOURCES})
+
+	target_compile_features(galactic-racer-letterboxing-tests PRIVATE
+		cxx_std_23
+	)
+
+	target_include_directories(galactic-racer-letterboxing-tests PRIVATE
+		"src/"
+	)
+
+	target_link_libraries(galactic-racer-letterboxing-tests PRIVATE
+		safetyhook
+	)
+
+	add_test(NAME galactic-racer-letterboxing-tests COMMAND galactic-racer-letterboxing-tests)
+	set_tests_properties(galactic-racer-letterboxing-tests PROPERTIES TIMEOUT 30)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
 # Target vr-plugin-nullifier
 set(CMKR_TARGET vr-plugin-nullifier)
 set(vr-plugin-nullifier_SOURCES "")
@@ -752,6 +1399,126 @@ set_target_properties(LuaVR PROPERTIES
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
 
+# Target lua-fname-binding-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET lua-fname-binding-tests)
+	set(lua-fname-binding-tests_SOURCES "")
+
+	list(APPEND lua-fname-binding-tests_SOURCES
+		"tests/LuaFNameBindingTests.cpp"
+	)
+
+	list(APPEND lua-fname-binding-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${lua-fname-binding-tests_SOURCES})
+	add_executable(lua-fname-binding-tests)
+
+	if(lua-fname-binding-tests_SOURCES)
+		target_sources(lua-fname-binding-tests PRIVATE ${lua-fname-binding-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT lua-fname-binding-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${lua-fname-binding-tests_SOURCES})
+
+	target_link_libraries(lua-fname-binding-tests PRIVATE
+		luavrlib
+	)
+
+	add_test(NAME lua-fname-bindings-8 COMMAND lua-fname-binding-tests 8)
+	add_test(NAME lua-fname-bindings-12 COMMAND lua-fname-binding-tests 12)
+	add_test(NAME lua-fname-bindings-legacy COMMAND lua-fname-binding-tests 8 legacy)
+	set_tests_properties(lua-fname-bindings-8 lua-fname-bindings-12 lua-fname-bindings-legacy PROPERTIES TIMEOUT 60)
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target lua-context-dispatch-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET lua-context-dispatch-tests)
+	set(lua-context-dispatch-tests_SOURCES "")
+
+	list(APPEND lua-context-dispatch-tests_SOURCES
+		"tests/LuaContextDispatchTests.cpp"
+	)
+
+	list(APPEND lua-context-dispatch-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${lua-context-dispatch-tests_SOURCES})
+	add_executable(lua-context-dispatch-tests)
+
+	if(lua-context-dispatch-tests_SOURCES)
+		target_sources(lua-context-dispatch-tests PRIVATE ${lua-context-dispatch-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT lua-context-dispatch-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${lua-context-dispatch-tests_SOURCES})
+
+	target_link_libraries(lua-context-dispatch-tests PRIVATE
+		luavrlib
+	)
+
+	foreach(case IN ITEMS reentry lock-order membership lifetime reset owner-reset queued-reset owner-retirement owned-state-teardown borrowed-state-teardown stress)
+	    add_test(NAME lua-context-dispatch-${case} COMMAND lua-context-dispatch-tests ${case})
+	    set_tests_properties(lua-context-dispatch-${case} PROPERTIES TIMEOUT 20)
+	endforeach()
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
+# Target lua-controller-input-tests
+if(UEVR_BUILD_COMPATIBILITY_TESTS) # compatibility-policy-tests
+	set(CMKR_TARGET lua-controller-input-tests)
+	set(lua-controller-input-tests_SOURCES "")
+
+	list(APPEND lua-controller-input-tests_SOURCES
+		"tests/LuaControllerInputTests.cpp"
+	)
+
+	list(APPEND lua-controller-input-tests_SOURCES
+		cmake.toml
+	)
+
+	set(CMKR_SOURCES ${lua-controller-input-tests_SOURCES})
+	add_executable(lua-controller-input-tests)
+
+	if(lua-controller-input-tests_SOURCES)
+		target_sources(lua-controller-input-tests PRIVATE ${lua-controller-input-tests_SOURCES})
+	endif()
+
+	get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} DEFINITION VS_STARTUP_PROJECT)
+	if(NOT CMKR_VS_STARTUP_PROJECT)
+		set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT lua-controller-input-tests)
+	endif()
+
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${lua-controller-input-tests_SOURCES})
+
+	target_link_libraries(lua-controller-input-tests PRIVATE
+		luavrlib
+	)
+
+	foreach(case IN ITEMS native openxr-sources legacy missing)
+	    add_test(NAME lua-controller-input-${case} COMMAND lua-controller-input-tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}")
+	    set_tests_properties(lua-controller-input-${case} PROPERTIES TIMEOUT 30)
+	endforeach()
+
+	unset(CMKR_TARGET)
+	unset(CMKR_SOURCES)
+endif()
+
 # Target uevr
 set(CMKR_TARGET uevr)
 set(uevr_SOURCES "")
@@ -789,9 +1556,13 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/D3D11Component.cpp"
 	"src/mods/vr/D3D12Component.cpp"
 	"src/mods/vr/FFakeStereoRenderingHook.cpp"
+	"src/mods/vr/GalacticRacerLetterboxing.cpp"
+	"src/mods/vr/GalacticRacerPanini.cpp"
 	"src/mods/vr/IXRTrackingSystemHook.cpp"
+	"src/mods/vr/KtjLOpenXRFactory.cpp"
 	"src/mods/vr/OverlayComponent.cpp"
 	"src/mods/vr/RenderTargetPoolHook.cpp"
+	"src/mods/vr/SatisfactoryRuntime.cpp"
 	"src/mods/vr/UE57SlateSymbols.cpp"
 	"src/mods/vr/d3d12/CommandContext.cpp"
 	"src/mods/vr/d3d12/DirectXTK.cpp"
@@ -809,8 +1580,12 @@ list(APPEND uevr_SOURCES
 	"src/uevr-imgui/imgui_impl_dx11.cpp"
 	"src/uevr-imgui/imgui_impl_dx12.cpp"
 	"src/uevr-imgui/imgui_impl_win32.cpp"
+	"src/utility/BuildIdentity.cpp"
+	"src/utility/HiFiRushHookMemory.cpp"
 	"src/utility/ImGui.cpp"
 	"src/DumperMode.hpp"
+	"src/utility/Nascar25HookCompatibility.cpp"
+	"src/utility/Nascar26HookCompatibility.cpp"
 	"src/ExceptionHandler.hpp"
 	"src/Framework.hpp"
 	"src/LicenseStrings.hpp"
@@ -839,15 +1614,81 @@ list(APPEND uevr_SOURCES
 	"src/mods/pluginloader/FUObjectArrayFunctions.hpp"
 	"src/mods/pluginloader/UScriptStructFunctions.hpp"
 	"src/mods/uobjecthook/SDKDumper.hpp"
+	"src/mods/vr/BodycamTextureLayout.hpp"
+	"src/mods/vr/Borderlands4Slate.hpp"
+	"src/mods/vr/BreathedgeInventoryPolicy.hpp"
+	"src/mods/vr/CVarDiagnostics.hpp"
 	"src/mods/vr/CVarManager.hpp"
+	"src/mods/vr/CompatibilityPolicy.hpp"
+	"src/mods/vr/ControllerTouchBindings.hpp"
 	"src/mods/vr/D3D11Component.hpp"
 	"src/mods/vr/D3D12Component.hpp"
+	"src/mods/vr/DuneFrameHandoff.hpp"
+	"src/mods/vr/DuneFrameHandoffDiscovery.hpp"
+	"src/mods/vr/DuneNativeTransaction.hpp"
+	"src/mods/vr/DuneRendererAbi.hpp"
+	"src/mods/vr/DuneSmartGI.hpp"
+	"src/mods/vr/DuneSmartGIContract.hpp"
 	"src/mods/vr/FFakeStereoRenderingHook.hpp"
+	"src/mods/vr/GalacticRacerBink.hpp"
+	"src/mods/vr/GalacticRacerBinkCode.hpp"
+	"src/mods/vr/GalacticRacerBinkSeek.hpp"
+	"src/mods/vr/GalacticRacerBinkSeekCode.hpp"
+	"src/mods/vr/GalacticRacerLetterboxing.hpp"
+	"src/mods/vr/GalacticRacerLetterboxingCode.hpp"
+	"src/mods/vr/GalacticRacerLetterboxingPolicy.hpp"
+	"src/mods/vr/GalacticRacerNativeFix.hpp"
+	"src/mods/vr/GalacticRacerNativeFixCode.hpp"
+	"src/mods/vr/GalacticRacerOwnedTexture.hpp"
+	"src/mods/vr/GalacticRacerPanini.hpp"
+	"src/mods/vr/GalacticRacerPaniniPolicy.hpp"
+	"src/mods/vr/GalacticRacerRHICommand.hpp"
+	"src/mods/vr/GalacticRacerRenderTargets.hpp"
+	"src/mods/vr/GamepadRecovery.hpp"
+	"src/mods/vr/GearsEDayAim.hpp"
+	"src/mods/vr/GearsEDayAllocation.hpp"
+	"src/mods/vr/GearsEDayNativeContracts.hpp"
+	"src/mods/vr/GearsEDayNativeFix.hpp"
+	"src/mods/vr/HalloweenNativeFix.hpp"
+	"src/mods/vr/HalloweenRenderTargets.hpp"
+	"src/mods/vr/HellraiserCaptureLayout.hpp"
+	"src/mods/vr/HiFiRushRendererEntry.hpp"
 	"src/mods/vr/IXRTrackingSystemHook.hpp"
+	"src/mods/vr/KtjLCloudHook.hpp"
+	"src/mods/vr/KtjLCloudOutput.hpp"
+	"src/mods/vr/KtjLCloudOutputContracts.hpp"
+	"src/mods/vr/KtjLCloudOutputHook.hpp"
+	"src/mods/vr/KtjLCloudResources.hpp"
+	"src/mods/vr/KtjLFogResources.hpp"
+	"src/mods/vr/KtjLHookContracts.hpp"
+	"src/mods/vr/KtjLLightingThread.hpp"
+	"src/mods/vr/KtjLMeshResourceContracts.hpp"
+	"src/mods/vr/KtjLMeshResourceHook.hpp"
+	"src/mods/vr/KtjLMeshResources.hpp"
+	"src/mods/vr/KtjLOpenXRFactory.hpp"
+	"src/mods/vr/KtjLRendererEntry.hpp"
+	"src/mods/vr/KtjLShadowGather.hpp"
+	"src/mods/vr/KtjLShadowGatherHook.hpp"
+	"src/mods/vr/NativeFrameDiagnostics.hpp"
+	"src/mods/vr/NativeFrameDiagnosticsJson.hpp"
 	"src/mods/vr/OverlayComponent.hpp"
 	"src/mods/vr/RenderTargetPoolHook.hpp"
+	"src/mods/vr/SWZeroCompanyBinary.hpp"
+	"src/mods/vr/SatisfactoryModular.hpp"
+	"src/mods/vr/SatisfactoryRuntime.hpp"
+	"src/mods/vr/SifuMeshCommands.hpp"
+	"src/mods/vr/SifuRendererEntry.hpp"
+	"src/mods/vr/Stalker2NativeD3D12.hpp"
+	"src/mods/vr/Stalker2NativePolicy.hpp"
+	"src/mods/vr/SteamFrameBindings.hpp"
+	"src/mods/vr/SteamFrameInput.hpp"
+	"src/mods/vr/StellarBladeRendererEntry.hpp"
+	"src/mods/vr/StockFrameBindingMigration.hpp"
+	"src/mods/vr/StupidNeverDiesUI.hpp"
 	"src/mods/vr/UE57SlateSymbols.hpp"
 	"src/mods/vr/UpscaleHelper.hpp"
+	"src/mods/vr/UE58OwnedUITexture.hpp"
+	"src/mods/vr/UE58UIInitialization.hpp"
 	"src/mods/vr/d3d12/ComPtr.hpp"
 	"src/mods/vr/d3d12/CommandContext.hpp"
 	"src/mods/vr/d3d12/DirectXTK.hpp"
@@ -867,8 +1708,29 @@ list(APPEND uevr_SOURCES
 	"src/render/ShaderOverrideRegistry.hpp"
 	"src/uevr-imgui/font_robotomedium.hpp"
 	"src/uevr-imgui/uevr_imconfig.hpp"
+	"src/utility/BoundedTextureDiagnostics.hpp"
+	"src/utility/BufferedRTTextureCall.hpp"
+	"src/utility/BuildIdentity.hpp"
+	"src/utility/FrameworkInitialization.hpp"
+	"src/utility/GpuRetirement.hpp"
+	"src/utility/HiFiRushHookMemory.hpp"
+	"src/utility/HookDiagnostics.hpp"
 	"src/utility/ImGui.hpp"
+	"src/utility/InputHookInstallation.hpp"
 	"src/utility/Logging.hpp"
+	"src/utility/Nascar26HookCompatibility.hpp"
+	"src/utility/NascarHookCompatibility.hpp"
+	"src/utility/OpaqueStateRegistry.hpp"
+	"src/utility/PostInitCodeMemory.hpp"
+	"src/utility/PostInitValidation.hpp"
+	"src/utility/ProtectedHookTrampoline.hpp"
+	"src/utility/SceneCaptureLifecycle.hpp"
+	"src/utility/SupportDiagnostics.hpp"
+	"src/utility/UObjectAllocatorDiscovery.hpp"
+	"src/utility/UObjectArrayBrowser.hpp"
+	"src/utility/UObjectCandidateSnapshot.hpp"
+	"src/utility/UObjectMetadataFilter.hpp"
+	"src/utility/UObjectScanBudget.hpp"
 	"src/uevr-imgui/imgui_impl_dx11.h"
 	"src/uevr-imgui/imgui_impl_dx12.h"
 	"src/uevr-imgui/imgui_impl_win32.h"
@@ -918,6 +1780,7 @@ target_link_libraries(uevr PUBLIC
 	openxr_loader
 	nlohmann_json
 	Version
+	bcrypt
 	TracyClient
 	DirectXTK
 	DirectXTK12

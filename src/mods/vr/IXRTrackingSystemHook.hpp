@@ -1,12 +1,15 @@
 #pragma once
 
-#include <cstdint>
-#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <array>
 #include <memory>
 
 #include <sdk/StereoStuff.hpp>
+#include <sdk/FinchAim.hpp>
+#include <sdk/ObjectIdentity.hpp>
+#include "FinchMenuView.hpp"
 #include <safetyhook.hpp>
 
 #include "Mod.hpp"
@@ -14,14 +17,12 @@
 namespace sdk {
 class UEngine;
 class UGameEngine;
-class UClass;
-class UFunction;
-class UObject;
 class IXRTrackingSystem;
 class IXRCamera;
 class IHeadMountedDisplay;
 class APlayerController;
 class APlayerCameraManager;
+class UClass;
 }
 
 class FFakeStereoRenderingHook;
@@ -46,6 +47,7 @@ public:
 
     void manual_update_control_rotation(sdk::UGameEngine* engine = nullptr);
     void update_view_rotation(sdk::UObject* reference_obj, Rotator<float>* rot);
+    bool preserve_finch_journal_pitch() const;
 
 private:
     struct ReferenceController {
@@ -64,6 +66,11 @@ private:
 
     void pre_initialize();
     void initialize();
+    bool try_install_finch_aim();
+    bool try_prepare_finch_menu_view();
+    bool is_current_finch_controller(sdk::APlayerController* controller) const;
+    static Rotator<float>* finch_camera_handoff(sdk::APlayerController* controller,
+        Rotator<float>* output, float delta_time, const Rotator<float>* requested, bool face_pawn);
     bool analyze_head_tracking_allowed(uintptr_t return_address);
 
     // IXRTrackingSystem
@@ -87,6 +94,7 @@ private:
     // IHeadMountedDisplay
     static bool is_hmd_connected(sdk::IHeadMountedDisplay*);
     static int32_t* get_ideal_debug_canvas_render_target_size(sdk::IHeadMountedDisplay*, int32_t* out);
+    static int32_t* get_gears_debug_canvas_render_target_size(sdk::IHeadMountedDisplay*, int32_t* out);
     static SharedPtr* get_view_extension(sdk::IHeadMountedDisplay*, SharedPtr* out);
 
     // IXRCamera
@@ -105,9 +113,15 @@ private:
 
     void pre_update_view_rotation(sdk::UObject* reference_obj, Rotator<float>* rot);
 
-    void update_daysgone_manual_aim_trace(sdk::UGameEngine* engine);
-    bool try_install_daysgone_manual_aim_trace(sdk::UObject* manual_aim);
-    static void* daysgone_six_axis_aim_trace(void* manual_aim, float* output_pair);
+    void update_daysgone_weapon_aim_bridge(sdk::UGameEngine* engine);
+    bool try_install_daysgone_weapon_aim_bridge(void* weapon);
+    bool validate_daysgone_weapon_object(void* weapon) const;
+    bool publish_daysgone_weapon_aim_sample();
+    void invalidate_daysgone_weapon_aim_sample();
+    void invalidate_daysgone_weapon_endpoint_sample();
+    void update_daysgone_reticle_alignment();
+    void restore_daysgone_reticle_alignment();
+    static void daysgone_weapon_aim_trace(safetyhook::Context& ctx);
 
     FFakeStereoRenderingHook* m_stereo_hook{nullptr};
 
@@ -157,26 +171,48 @@ private:
     uintptr_t m_addr_of_process_view_rotation_ptr{};
     //std::unique_ptr<PointerHook> m_process_view_rotation_hook{};
     safetyhook::InlineHook m_process_view_rotation_hook{};
-    safetyhook::InlineHook m_daysgone_six_axis_aim_hook{};
-    std::atomic<sdk::UObject*> m_daysgone_active_manual_aim{};
-    std::atomic<float> m_daysgone_desired_pitch_offset_degrees{};
-    std::atomic<float> m_daysgone_desired_yaw_offset_degrees{};
+    safetyhook::InlineHook m_finch_camera_handoff_hook{};
+    safetyhook::MidHook m_daysgone_weapon_aim_trace_hook{};
+    std::atomic<void*> m_daysgone_active_pawn{};
+    std::atomic<void*> m_daysgone_active_controller{};
+    std::atomic<float> m_daysgone_desired_aim_x{};
+    std::atomic<float> m_daysgone_desired_aim_y{};
+    std::atomic<float> m_daysgone_desired_aim_z{};
     std::atomic<uint64_t> m_daysgone_desired_aim_sequence{};
-    std::atomic<uint64_t> m_daysgone_consumed_aim_sequence{};
     std::atomic<uint64_t> m_daysgone_desired_aim_sample_time_ms{};
+    std::atomic<float> m_daysgone_weapon_endpoint_x{};
+    std::atomic<float> m_daysgone_weapon_endpoint_y{};
+    std::atomic<float> m_daysgone_weapon_endpoint_z{};
+    std::atomic<uint64_t> m_daysgone_weapon_endpoint_sequence{};
+    std::atomic<uint64_t> m_daysgone_weapon_endpoint_sample_time_ms{};
     std::atomic<uint64_t> m_daysgone_aim_trace_next_log_ms{};
-    sdk::UClass* m_daysgone_manual_aim_class{};
-    uintptr_t m_daysgone_manual_aim_update{};
-    uintptr_t m_daysgone_six_axis_decoder{};
-    uintptr_t m_daysgone_rejected_manual_aim_vtable{};
-    std::chrono::steady_clock::time_point m_daysgone_manual_aim_next_retry{};
+    void* m_daysgone_reticle_root{};
+    void* m_daysgone_reticle_slot{};
+    float m_daysgone_reticle_original_x{};
+    float m_daysgone_reticle_original_y{};
+    bool m_daysgone_reticle_original_captured{};
+    uint64_t m_daysgone_reticle_next_log_ms{};
+    uintptr_t m_daysgone_weapon_aim_trace_update{};
+    uintptr_t m_daysgone_rejected_weapon_vtable{};
+    std::chrono::steady_clock::time_point m_daysgone_weapon_aim_next_retry{};
     bool m_attempted_hook_view_rotation{false};
     bool m_initialized{false};
+    std::atomic<bool> m_finch_aim_hook_owned{false};
+    sdk::finch::aim::Contract m_finch_aim_contract{};
+    sdk::finch::aim::Layout m_finch_aim_layout{};
+    sdk::finch::aim::SetupBudget m_finch_aim_setup{};
+    std::array<sdk::UClass*, 6> m_finch_aim_classes{};
+    sdk::finch::aim::Contract m_finch_menu_contract{};
+    sdk::finch::aim::Layout m_finch_menu_layout{};
+    sdk::finch::aim::SetupBudget m_finch_menu_setup{};
+    uevr::finch_menu::Binding m_finch_menu_binding{};
+    std::array<sdk::object_liveness::Identity, 8> m_finch_menu_objects{};
     bool m_is_leq_4_25{false}; // <= 4.25, IsHeadTrackingAllowedForWorld does not exist
     bool m_is_leq_4_17{false}; // <= 4.17, IXRTrackingSystem and IXRCamera do not exist
     bool m_relative_transform_corrected{false}; // For UpdatePlayerCamera, causes player to become a midget if not corrected
 
     size_t m_offset_in_engine{0};
+    uintptr_t m_gears_debug_canvas_return_address{};
 
     union {
         Rotator<float> m_last_view_rotation;

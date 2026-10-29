@@ -52,7 +52,7 @@ Universal Unreal Engine VR Mod (4/5)
 
 ## Supported Engine Versions
 
-4.8 - 5.4
+4.8 - 5.8.4
 
 ## Links
 
