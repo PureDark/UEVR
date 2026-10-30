@@ -1561,6 +1561,7 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/IXRTrackingSystemHook.cpp"
 	"src/mods/vr/KtjLOpenXRFactory.cpp"
 	"src/mods/vr/OverlayComponent.cpp"
+	"src/mods/vr/PhantomBladeZeroUI.hpp"
 	"src/mods/vr/RenderTargetPoolHook.cpp"
 	"src/mods/vr/SatisfactoryRuntime.cpp"
 	"src/mods/vr/UE57SlateSymbols.cpp"
@@ -1835,4 +1836,3 @@ uevr_attach_full_renderdoc(uevr)
 
 unset(CMKR_TARGET)
 unset(CMKR_SOURCES)
-
